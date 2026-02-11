@@ -487,8 +487,9 @@ async fn main() -> Result<()> {
                 None
             };
 
-            // Set expected audience for CWT validation if server URL is configured
+            // Configure CWT validation
             if let Some(ref mut authenticator) = auth {
+                authenticator.set_valid_issuers(config.server.valid_issuers.clone());
                 authenticator.set_expected_audience(config.server.url.clone());
                 if let Some(ref url) = config.server.url {
                     tracing::info!("CWT audience validation enabled for: {}", url);

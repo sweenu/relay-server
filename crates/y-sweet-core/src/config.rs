@@ -107,6 +107,18 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
         },
     },
     EnvOverride {
+        env_var: "RELAY_SERVER_VALID_ISSUERS",
+        config_path: "server.valid_issuers",
+        apply: |config, value| {
+            let mut issuers: Vec<String> = value.split(',').map(|s| s.trim().to_string()).collect();
+            if !issuers.contains(&"relay-server".to_string()) {
+                issuers.push("relay-server".to_string());
+            }
+            config.server.valid_issuers = issuers;
+            Ok(())
+        },
+    },
+    EnvOverride {
         env_var: "RELAY_SERVER_ALLOWED_HOSTS",
         config_path: "server.allowed_hosts",
         apply: |config, value| {
@@ -305,6 +317,9 @@ pub struct ServerConfig {
 
     #[serde(default = "default_redact_errors")]
     pub redact_errors: bool,
+
+    #[serde(default = "default_valid_issuers")]
+    pub valid_issuers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -519,6 +534,10 @@ fn default_redact_errors() -> bool {
     false
 }
 
+fn default_valid_issuers() -> Vec<String> {
+    vec!["relay-server".to_string()]
+}
+
 fn default_expiration_seconds() -> u64 {
     3600
 }
@@ -549,6 +568,7 @@ impl Default for ServerConfig {
             checkpoint_freq_seconds: default_checkpoint_freq_seconds(),
             doc_gc: default_doc_gc(),
             redact_errors: default_redact_errors(),
+            valid_issuers: default_valid_issuers(),
         }
     }
 }

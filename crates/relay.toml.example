@@ -5,6 +5,7 @@ url = "https://api.example.com"  # RELAY_SERVER_URL
 
 host = "0.0.0.0"                 # RELAY_SERVER_HOST
 port = 8080                      # PORT
+# valid_issuers = ["relay-server", "relay-control-plane"]  # RELAY_SERVER_VALID_ISSUERS
 
 [metrics]
 port = 9090                      # METRICS_PORT

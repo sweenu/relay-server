@@ -192,6 +192,7 @@ pub struct Authenticator {
     pub key_lookup: std::collections::HashMap<String, usize>,
     pub keys_without_id: Vec<usize>,
     pub expected_audience: Option<String>,
+    pub valid_issuers: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -680,6 +681,7 @@ impl Authenticator {
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
             expected_audience: None,
+            valid_issuers: vec!["relay-server".to_string()],
         })
     }
 
@@ -740,12 +742,22 @@ impl Authenticator {
             key_lookup,
             keys_without_id,
             expected_audience: None,
+            valid_issuers: vec!["relay-server".to_string()],
         })
     }
 
     /// Set the expected audience for CWT token validation
     pub fn set_expected_audience(&mut self, audience: Option<String>) {
         self.expected_audience = audience;
+    }
+
+    /// Set valid issuers for CWT token validation.
+    /// "relay-server" is always included as a valid issuer.
+    pub fn set_valid_issuers(&mut self, mut issuers: Vec<String>) {
+        if !issuers.iter().any(|s| s == "relay-server") {
+            issuers.push("relay-server".to_string());
+        }
+        self.valid_issuers = issuers;
     }
 
     /// Create a CWT authenticator from a specific key entry
@@ -939,6 +951,7 @@ impl Authenticator {
             key_lookup,
             keys_without_id,
             expected_audience: None,
+            valid_issuers: vec!["relay-server".to_string()],
         }
     }
 
@@ -1298,6 +1311,7 @@ impl Authenticator {
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
             expected_audience: None,
+            valid_issuers: vec!["relay-server".to_string()],
         })
     }
 
@@ -1322,6 +1336,7 @@ impl Authenticator {
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
             expected_audience: None,
+            valid_issuers: vec!["relay-server".to_string()],
         })
     }
 
@@ -1343,6 +1358,7 @@ impl Authenticator {
             key_lookup: std::collections::HashMap::new(),
             keys_without_id: vec![0],
             expected_audience: None,
+            valid_issuers: vec!["relay-server".to_string()],
         })
     }
 
@@ -1611,10 +1627,9 @@ impl Authenticator {
             claims.scope
         );
 
-        // Validate issuer - accept relay-server, auth.system3.dev, and auth.system3.md
+        // Validate issuer against configured valid_issuers
         if let Some(ref issuer) = claims.issuer {
-            const VALID_ISSUERS: &[&str] = &["relay-server", "auth.system3.dev", "auth.system3.md"];
-            if !VALID_ISSUERS.contains(&&**issuer) {
+            if !self.valid_issuers.iter().any(|v| v == issuer) {
                 tracing::debug!("Invalid issuer: {}", issuer);
                 return Err(AuthError::InvalidClaims);
             }
@@ -1793,10 +1808,9 @@ impl Authenticator {
             claims.scope
         );
 
-        // Validate issuer - accept relay-server, auth.system3.dev, and auth.system3.md
+        // Validate issuer against configured valid_issuers
         if let Some(ref issuer) = claims.issuer {
-            const VALID_ISSUERS: &[&str] = &["relay-server", "auth.system3.dev", "auth.system3.md"];
-            if !VALID_ISSUERS.contains(&&**issuer) {
+            if !self.valid_issuers.iter().any(|v| v == issuer) {
                 tracing::debug!("Invalid issuer: {}", issuer);
                 return Err(AuthError::InvalidClaims);
             }
@@ -3749,5 +3763,60 @@ mod tests {
             parsed.allowed_token_types,
             vec![TokenType::Document, TokenType::File]
         );
+    }
+
+    #[test]
+    fn test_custom_valid_issuer_accepted() {
+        use crate::cwt::{CwtClaims, permission_to_scope};
+
+        let mut auth = Authenticator::gen_key().unwrap();
+        auth.set_expected_audience(Some("https://api.example.com".to_string()));
+        auth.set_valid_issuers(vec!["relay-control-plane".to_string()]);
+
+        // "relay-server" should always be included
+        assert!(auth.valid_issuers.contains(&"relay-server".to_string()));
+        assert!(auth.valid_issuers.contains(&"relay-control-plane".to_string()));
+
+        // Build a CWT token with the custom issuer
+        let cwt_auth = auth.create_cwt_authenticator().unwrap();
+        let claims = CwtClaims {
+            issuer: Some("relay-control-plane".to_string()),
+            subject: Some("user123".to_string()),
+            audience: Some("https://api.example.com".to_string()),
+            expiration: None,
+            issued_at: None,
+            scope: permission_to_scope(&Permission::Doc(DocPermission {
+                doc_id: "doc1".to_string(),
+                authorization: Authorization::Full,
+                user: Some("user123".to_string()),
+            })),
+            channel: None,
+        };
+        let token_bytes = cwt_auth.create_cwt(claims).unwrap();
+        let token = BASE64_CUSTOM.encode(&token_bytes);
+
+        // Should verify successfully with custom issuer
+        let result = auth.verify_doc_token(&token, "doc1", 0);
+        assert!(result.is_ok());
+
+        // Now test that an unknown issuer is rejected
+        let claims_bad = CwtClaims {
+            issuer: Some("unknown-issuer".to_string()),
+            subject: Some("user123".to_string()),
+            audience: Some("https://api.example.com".to_string()),
+            expiration: None,
+            issued_at: None,
+            scope: permission_to_scope(&Permission::Doc(DocPermission {
+                doc_id: "doc1".to_string(),
+                authorization: Authorization::Full,
+                user: Some("user123".to_string()),
+            })),
+            channel: None,
+        };
+        let bad_token_bytes = cwt_auth.create_cwt(claims_bad).unwrap();
+        let bad_token = BASE64_CUSTOM.encode(&bad_token_bytes);
+
+        let result = auth.verify_doc_token(&bad_token, "doc1", 0);
+        assert!(result.is_err());
     }
 }
