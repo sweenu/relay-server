@@ -606,7 +606,7 @@ impl Server {
     pub async fn get_or_create_doc(
         &self,
         doc_id: &str,
-    ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
+    ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
         if !self.docs.contains_key(doc_id) {
             tracing::info!(doc_id=?doc_id, "Loading doc");
             self.load_doc(doc_id, None).await?;
@@ -623,7 +623,7 @@ impl Server {
         &self,
         doc_id: &str,
         routing_channel: Option<String>,
-    ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
+    ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
         self.get_or_create_doc_with_channel_and_user(doc_id, routing_channel, None)
             .await
     }
@@ -633,7 +633,7 @@ impl Server {
         doc_id: &str,
         routing_channel: Option<String>,
         user: Option<String>,
-    ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
+    ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
         if !self.docs.contains_key(doc_id) {
             tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc with channel and user");
             self.load_doc_with_user(doc_id, routing_channel, user)
