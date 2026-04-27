@@ -831,6 +831,21 @@ impl Server {
         s.serve_internal(listener, false, routes).await
     }
 
+    async fn ensure_socket_doc_access(
+        &self,
+        doc_id: &str,
+        authorization: Authorization,
+    ) -> Result<(), AppError> {
+        if !matches!(authorization, Authorization::Full) && !self.doc_exists(doc_id).await {
+            return Err(AppError::new(
+                StatusCode::NOT_FOUND,
+                anyhow!("Doc {} not found", doc_id),
+            ));
+        }
+
+        Ok(())
+    }
+
     fn verify_doc_token(&self, token: Option<&str>, doc: &str) -> Result<Authorization, AppError> {
         if let Some(authenticator) = &self.authenticator {
             if let Some(token) = token {
@@ -999,12 +1014,9 @@ async fn handle_socket_upgrade_with_channel_and_user(
     token: Option<String>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
-    if !matches!(authorization, Authorization::Full) && !server_state.docs.contains_key(&doc_id) {
-        return Err(AppError::new(
-            StatusCode::NOT_FOUND,
-            anyhow!("Doc {} not found", doc_id),
-        ));
-    }
+    server_state
+        .ensure_socket_doc_access(&doc_id, authorization)
+        .await?;
 
     // Extract expiration time from token
     let expiration_time = if let Some(authenticator) = &server_state.authenticator {
@@ -2541,6 +2553,74 @@ mod test {
         assert_eq!(authorization, Authorization::Full);
         assert_eq!(channel, None);
         assert_eq!(user, None);
+    }
+
+    #[tokio::test]
+    async fn test_read_only_socket_access_allows_persisted_unloaded_doc() {
+        use async_trait::async_trait;
+        use std::collections::HashSet;
+        use y_sweet_core::store::Result as StoreResult;
+
+        struct ExistingDocStore {
+            existing_keys: HashSet<String>,
+        }
+
+        #[async_trait]
+        impl Store for ExistingDocStore {
+            async fn init(&self) -> StoreResult<()> {
+                Ok(())
+            }
+
+            async fn get(&self, _key: &str) -> StoreResult<Option<Vec<u8>>> {
+                Ok(None)
+            }
+
+            async fn set(&self, _key: &str, _value: Vec<u8>) -> StoreResult<()> {
+                Ok(())
+            }
+
+            async fn remove(&self, _key: &str) -> StoreResult<()> {
+                Ok(())
+            }
+
+            async fn exists(&self, key: &str) -> StoreResult<bool> {
+                Ok(self.existing_keys.contains(key))
+            }
+        }
+
+        let doc_id = "persisted-doc";
+        let store = ExistingDocStore {
+            existing_keys: HashSet::from([format!("{}/data.ysweet", doc_id)]),
+        };
+        let server = Server::new(
+            Some(Box::new(store)),
+            Duration::from_secs(60),
+            None,
+            None,
+            vec![],
+            CancellationToken::new(),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!server.docs.contains_key(doc_id));
+        server
+            .ensure_socket_doc_access(doc_id, Authorization::ReadOnly)
+            .await
+            .unwrap();
+
+        let err = server
+            .ensure_socket_doc_access("missing-doc", Authorization::ReadOnly)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+        server
+            .ensure_socket_doc_access("new-doc", Authorization::Full)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
