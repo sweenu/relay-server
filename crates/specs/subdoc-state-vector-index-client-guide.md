@@ -1,8 +1,8 @@
-# Client Implementor's Guide: Subdocument State Vector Index
+# Client Implementor's Guide: Subdocument Snapshot Index
 
 ## Overview
 
-The subdocument state vector index allows a client connected to a **parent document** to efficiently determine which subdocuments have changed since its last connection, without opening a sync connection to every subdocument.
+The subdocument snapshot index allows a client connected to a **parent document** to efficiently determine which subdocuments have changed since its last connection, without opening a sync connection to every subdocument.
 
 This guide covers how to implement the client side in TypeScript, building on the existing `YSweetProvider` pattern in `~/stash/relay/src/client/provider.ts`.
 
@@ -20,16 +20,16 @@ These follow the same pattern as the existing message type constants (`messageSy
 
 ### `MSG_QUERY_SUBDOCS` (7) — Client → Server
 
-No payload. The client sends this to request the subdocument state vector index from the server.
+Payload is a varuint GUID count followed by that many varstring GUIDs. Send count `0` to request the full subdocument snapshot index from the server.
 
 ### `MSG_SUBDOCS` (8) — Server → Client
 
-Payload is a CBOR map where keys are subdocument ID strings and values are raw Yjs state vector bytes:
+Payload is a CBOR map where keys are subdocument ID strings and values are raw Yjs snapshot bytes:
 
 ```
 {
-  "subdoc-abc": <Uint8Array of encoded state vector>,
-  "subdoc-def": <Uint8Array of encoded state vector>,
+  "subdoc-abc": <Uint8Array of encoded snapshot>,
+  "subdoc-def": <Uint8Array of encoded snapshot>,
 }
 ```
 
@@ -42,14 +42,18 @@ Both message types use the standard lib0 varint encoding, matching every other m
 ```typescript
 import * as encoding from 'lib0/encoding'
 
-function sendQuerySubdocs(ws: WebSocket) {
+function sendQuerySubdocs(ws: WebSocket, guids: string[] = []) {
   const encoder = encoding.createEncoder()
   encoding.writeVarUint(encoder, 7) // messageQuerySubdocs
+  encoding.writeVarUint(encoder, guids.length)
+  guids.forEach(guid => {
+    encoding.writeVarString(encoder, guid)
+  })
   ws.send(encoding.toUint8Array(encoder))
 }
 ```
 
-That's it — no payload. The message is a single varint byte on the wire.
+For "all subdocs", `guids` is empty and the wire bytes are `0x07 0x00`: message type 7 followed by a zero count.
 
 ### Receiving `MSG_SUBDOCS`
 
@@ -75,12 +79,12 @@ messageHandlers[messageSubdocs] = (
     const subdocIndex: Record<string, Uint8Array> = decodeCBOR(cborData)
     provider.handleSubdocIndex(subdocIndex)
   } catch (error) {
-    console.error('Failed to decode subdoc state vector index:', error)
+    console.error('Failed to decode subdoc snapshot index:', error)
   }
 }
 ```
 
-The decoded object is a `Record<string, Uint8Array>` — keys are subdocument IDs, values are Yjs state vectors encoded with `Y.encodeStateVector()`.
+The decoded object is a `Record<string, Uint8Array>` — keys are subdocument IDs, values are Yjs snapshots encoded with `Y.encodeSnapshot(Y.snapshot(doc))`. A snapshot includes both the state vector and delete set.
 
 ## Integration into YSweetProvider
 
@@ -93,10 +97,11 @@ The natural place is inside `websocket.onopen` in `setupWS`, right after flushin
 ```typescript
 // In setupWS, inside websocket.onopen, after event re-subscription:
 
-// Query subdoc state vectors for catch-up
+// Query subdoc snapshots for catch-up
 if (provider.onSubdocIndex) {
   const encoderSubdocs = encoding.createEncoder()
   encoding.writeVarUint(encoderSubdocs, messageQuerySubdocs)
+  encoding.writeVarUint(encoderSubdocs, 0) // all subdocs
   websocket.send(encoding.toUint8Array(encoderSubdocs))
 }
 ```
@@ -117,23 +122,23 @@ export type SubdocIndexCallback = (
 
 onSubdocIndex: SubdocIndexCallback | null = null
 
-/** Map of local state vectors by doc ID, populated by the consumer */
-localStateVectors: Map<string, Uint8Array> = new Map()
+/** Map of local snapshots by doc ID, populated by the consumer */
+localSnapshots: Map<string, Uint8Array> = new Map()
 
 handleSubdocIndex(serverIndex: Record<string, Uint8Array>) {
   const allDocIds = Object.keys(serverIndex)
   const staleDocIds: string[] = []
 
-  for (const [docId, serverSV] of Object.entries(serverIndex)) {
-    const localSV = this.localStateVectors.get(docId)
+  for (const [docId, serverSnapshot] of Object.entries(serverIndex)) {
+    const localSnapshot = this.localSnapshots.get(docId)
 
-    if (!localSV) {
+    if (!localSnapshot) {
       // Never seen this doc — it's stale (or new)
       staleDocIds.push(docId)
       continue
     }
 
-    if (!stateVectorsEqual(localSV, serverSV)) {
+    if (!snapshotsEqual(localSnapshot, serverSnapshot)) {
       staleDocIds.push(docId)
     }
   }
@@ -142,14 +147,14 @@ handleSubdocIndex(serverIndex: Record<string, Uint8Array>) {
 }
 ```
 
-### State Vector Comparison
+### Snapshot Comparison
 
-Yjs state vectors are encoded as a list of `(clientID, clock)` pairs. Two state vectors are equal if and only if they contain the same set of clients with the same clocks. The comparison function:
+Yjs snapshots include both a state vector and a delete set. Two subdocuments are caught up only when both parts match. The comparison function:
 
 ```typescript
 import * as Y from 'yjs'
 
-function stateVectorsEqual(a: Uint8Array, b: Uint8Array): boolean {
+function snapshotsEqual(a: Uint8Array, b: Uint8Array): boolean {
   // Fast path: byte-level equality
   if (a.length === b.length) {
     let equal = true
@@ -162,28 +167,17 @@ function stateVectorsEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (equal) return true
   }
 
-  // Slow path: decode and compare semantically
-  // (different encoding order can produce different bytes for equal vectors)
-  const svA = Y.decodeStateVector(a)
-  const svB = Y.decodeStateVector(b)
-
-  if (svA.size !== svB.size) return false
-
-  for (const [clientId, clock] of svA) {
-    if (svB.get(clientId) !== clock) return false
-  }
-
-  return true
+  return Y.equalSnapshots(Y.decodeSnapshot(a), Y.decodeSnapshot(b))
 }
 ```
 
-### Getting Local State Vectors
+### Getting Local Snapshots
 
-The consumer must populate `localStateVectors` before the query is sent. How you get them depends on your storage layer:
+The consumer must populate `localSnapshots` before the query is sent. How you get them depends on your storage layer:
 
 ```typescript
-// Example: reading state vectors from IndexedDB-persisted Y.Docs
-async function getLocalStateVectors(
+// Example: reading snapshots from IndexedDB-persisted Y.Docs
+async function getLocalSnapshots(
   docIds: string[],
 ): Promise<Map<string, Uint8Array>> {
   const result = new Map<string, Uint8Array>()
@@ -191,7 +185,7 @@ async function getLocalStateVectors(
   for (const docId of docIds) {
     const doc = await loadDocFromIDB(docId) // your persistence layer
     if (doc) {
-      result.set(docId, Y.encodeStateVector(doc))
+      result.set(docId, Y.encodeSnapshot(Y.snapshot(doc)))
       doc.destroy()
     }
   }
@@ -200,7 +194,7 @@ async function getLocalStateVectors(
 }
 ```
 
-If you don't have any local state vectors (first connection), every subdocument will appear stale — which is correct. You sync everything on first connection.
+If you don't have any local snapshots (first connection), every subdocument will appear stale — which is correct. You sync everything on first connection.
 
 ## End-to-End Flow
 
@@ -220,10 +214,10 @@ Here's the complete reconnection catch-up sequence:
   4. Query subdocs     │─── MSG_QUERY_SUBDOCS (7) ────>│
                        │                               │
   5. Receive index     │<── MSG_SUBDOCS (8) ───────────│
-                       │    {docId: stateVector, ...}   │
+                       │    {docId: snapshot, ...}      │
                        │                               │
-  6. Compare locally   │  for each (docId, serverSV):   │
-                       │    if localSV != serverSV:     │
+  6. Compare locally   │  for each (docId, serverSnap): │
+                       │    if localSnap != serverSnap: │
                        │      staleDocIds.push(docId)   │
                        │                               │
   7. Sync stale docs   │─── open WS to subdoc-abc ────>│
@@ -249,20 +243,20 @@ In `SharedFolder.ts`, the existing `setupEventSubscriptions()` subscribes to `"d
 private async performSubdocCatchUp() {
   if (!this._provider) return
 
-  // Collect local state vectors for all known documents
-  const localSVs = new Map<string, Uint8Array>()
+  // Collect local snapshots for all known documents
+  const localSnapshots = new Map<string, Uint8Array>()
   for (const [guid, file] of this.files) {
     if (isDocument(file)) {
       const docId = `${this.relayId}-${guid}`
       const doc = await this.loadDocFromStorage(guid)
       if (doc) {
-        localSVs.set(docId, Y.encodeStateVector(doc))
+        localSnapshots.set(docId, Y.encodeSnapshot(Y.snapshot(doc)))
         doc.destroy()
       }
     }
   }
 
-  this._provider.localStateVectors = localSVs
+  this._provider.localSnapshots = localSnapshots
   this._provider.onSubdocIndex = (staleDocIds, allDocIds) => {
     // Sync only the stale documents
     for (const docId of staleDocIds) {
@@ -274,6 +268,7 @@ private async performSubdocCatchUp() {
   if (this._provider.wsconnected) {
     const encoder = encoding.createEncoder()
     encoding.writeVarUint(encoder, 7) // messageQuerySubdocs
+    encoding.writeVarUint(encoder, 0) // all subdocs
     this._provider.ws!.send(encoding.toUint8Array(encoder))
   }
 }
@@ -283,7 +278,7 @@ private async performSubdocCatchUp() {
 
 ### First Connection (No Local State)
 
-If the client has no local state vectors (fresh install), every subdocument in the server's index will appear stale. This is correct — the client needs to sync everything. The index still helps by giving the client the full list of subdocument IDs in one round-trip.
+If the client has no local snapshots (fresh install), every subdocument in the server's index will appear stale. This is correct — the client needs to sync everything. The index still helps by giving the client the full list of subdocument IDs in one round-trip.
 
 ### Empty Index
 
@@ -291,15 +286,11 @@ If the parent document has no subdocuments, the server returns an empty CBOR map
 
 ### Race: Updates During Catch-Up
 
-If subdocuments are updated while the client is syncing stale ones, those updates are handled by the normal Yjs sync protocol on each subdocument's own WebSocket connection. Once the client subscribes to `document.updated` events on the parent, it receives real-time notifications for any further changes. The brief window between receiving the index and subscribing to events is safe because each individual subdoc sync uses the Yjs state vector exchange, which is idempotent.
+If subdocuments are updated while the client is syncing stale ones, those updates are handled by the normal Yjs sync protocol on each subdocument's own WebSocket connection. Once the client subscribes to `document.updated` events on the parent, it receives real-time notifications for any further changes. The brief window between receiving the index and subscribing to events is safe because each individual subdoc sync uses the Yjs state exchange, which is idempotent.
 
-### Server Doesn't Support the Message
+### Invalid Frames
 
-An old server that doesn't recognize tag 7 will hit the `Custom` catch-all in the decoder, which calls `read_buf()` expecting a length-prefixed payload. Since `MSG_QUERY_SUBDOCS` has no payload, this produces an `EndOfBuffer` decode error. The error is caught in `DocConnection::send`, logged, and the connection continues normally.
-
-This is safe because each `ws.send()` produces its own WebSocket frame, and the server decodes each frame independently — there are no trailing bytes to misinterpret. The same is true for `EventSubscribe` and all other newer message types against older servers.
-
-The client should treat a timeout (no `MSG_SUBDOCS` response within a few seconds) as "not supported" and fall back to syncing all subdocuments.
+A tag-only `MSG_QUERY_SUBDOCS` frame is invalid. The client must always write the GUID count after message type 7, even when the count is `0`.
 
 ## Dependencies
 
@@ -307,4 +298,4 @@ The implementation uses the same dependencies already in the project:
 
 - **lib0** (`encoding`, `decoding`) — message framing
 - **cbor-x** (`decode`) — CBOR deserialization of the subdoc index
-- **yjs** (`Y.encodeStateVector`, `Y.decodeStateVector`) — state vector operations
+- **yjs** (`Y.snapshot`, `Y.encodeSnapshot`, `Y.decodeSnapshot`, `Y.equalSnapshots`) — snapshot operations

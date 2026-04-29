@@ -54,7 +54,7 @@ pub struct DocConnection {
     /// If None, the token never expires.
     expiration_time: Option<u64>,
 
-    /// Optional reference to the document's SyncKv for reading subdoc state vectors
+    /// Optional reference to the document's SyncKv for reading subdoc snapshots
     sync_kv: Option<Arc<SyncKv>>,
 
     /// Authenticated user identity from the connection token.
@@ -211,7 +211,7 @@ impl DocConnection {
         }
     }
 
-    /// Set the SyncKv reference for subdoc state vector queries
+    /// Set the SyncKv reference for subdoc snapshot queries
     pub fn set_sync_kv(&mut self, sync_kv: Arc<SyncKv>) {
         self.sync_kv = Some(sync_kv);
     }
@@ -487,7 +487,7 @@ impl DocConnection {
                     Vec::new()
                 };
 
-                // Build response: {guid: state_vector_bytes, ...}
+                // Build response: {guid: snapshot_bytes, ...}
                 let mut response_entries = Vec::new();
                 for (k, v) in &entries {
                     if let ciborium::value::Value::Map(fields) = v {
@@ -497,7 +497,7 @@ impl DocConnection {
                                 ciborium::value::Value::Bytes(_),
                             ) = (fk, fv)
                             {
-                                if fname == "state_vector" {
+                                if fname == "snapshot" {
                                     response_entries.push((k.clone(), fv.clone()));
                                 }
                             }

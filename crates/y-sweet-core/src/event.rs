@@ -85,8 +85,8 @@ pub struct DocumentUpdatedEvent {
     pub metadata: BTreeMap<String, serde_json::Value>,
     #[serde(skip)] // Don't serialize the raw update data to JSON
     pub update: Option<Vec<u8>>,
-    #[serde(skip)] // Internal use only: encoded state vector after this update
-    pub state_vector: Option<Vec<u8>>,
+    #[serde(skip)] // Internal use only: encoded snapshot after this update
+    pub snapshot: Option<Vec<u8>>,
 }
 
 impl DocumentUpdatedEvent {
@@ -97,7 +97,7 @@ impl DocumentUpdatedEvent {
             user: None,
             metadata: BTreeMap::new(),
             update: None,
-            state_vector: None,
+            snapshot: None,
         }
     }
 
@@ -113,9 +113,9 @@ impl DocumentUpdatedEvent {
         self
     }
 
-    /// Builder method to add encoded state vector
-    pub fn with_state_vector(mut self, state_vector: Vec<u8>) -> Self {
-        self.state_vector = Some(state_vector);
+    /// Builder method to add encoded Yjs snapshot
+    pub fn with_snapshot(mut self, snapshot: Vec<u8>) -> Self {
+        self.snapshot = Some(snapshot);
         self
     }
 

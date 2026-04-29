@@ -232,8 +232,8 @@ pub enum Message {
     Event(Vec<u8>),                // CBOR-encoded EventMessage
     EventSubscribe(Vec<String>),   // List of event types to subscribe to
     EventUnsubscribe(Vec<String>), // List of event types to unsubscribe from
-    QuerySubdocs(Vec<String>), // Client → server: request subdoc state vectors for given guids (empty = all)
-    Subdocs(Vec<u8>),          // Server → client: CBOR map of {doc_id: state_vector_bytes}
+    QuerySubdocs(Vec<String>), // Client → server: request subdoc snapshots for given guids (empty = all)
+    Subdocs(Vec<u8>),          // Server → client: CBOR map of {doc_id: snapshot_bytes}
     Custom(u8, Vec<u8>),
 }
 
@@ -874,7 +874,7 @@ mod test {
 
     #[test]
     fn test_subdocs_message_encoding() {
-        // Build a CBOR map with subdoc state vectors
+        // Build a CBOR map with subdoc snapshots
         let cbor_map = ciborium::value::Value::Map(vec![
             (
                 ciborium::value::Value::Text("subdoc-abc".to_string()),

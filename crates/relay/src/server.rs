@@ -398,14 +398,12 @@ impl Server {
                         event.user = Some(user.clone());
                     }
 
-                    // Update parent's subdoc state vector index
+                    // Update parent's subdoc snapshot index
                     if routing_channel_for_callback != doc_id_for_callback {
-                        if let Some(state_vector) = &event.state_vector {
+                        if let Some(snapshot) = &event.snapshot {
                             if let Some(parent) = docs.get(&routing_channel_for_callback) {
-                                parent.update_subdoc_state_vector(
-                                    &doc_id_for_callback,
-                                    state_vector.clone(),
-                                );
+                                parent
+                                    .update_subdoc_snapshot(&doc_id_for_callback, snapshot.clone());
                             }
                         }
                     }

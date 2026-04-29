@@ -61,14 +61,14 @@ impl DocWithSyncKv {
 
                 // Trigger webhook if callback is configured
                 if let Some(ref callback) = webhook_callback {
-                    // Extract state vector from the transaction (post-update)
-                    let sv = txn.state_vector().encode_v1();
+                    // Extract the full snapshot from the transaction (post-update).
+                    let snapshot = txn.snapshot().encode_v1();
 
-                    // Create the event payload with business data, metadata, update, and state vector
+                    // Create the event payload with business data, metadata, update, and snapshot
                     let event = DocumentUpdatedEvent::new(doc_key.clone())
                         .with_metadata(&sync_kv)
                         .with_update(event.update.to_vec())
-                        .with_state_vector(sv);
+                        .with_snapshot(snapshot);
 
                     // Callback handles envelope creation and dispatch
                     callback(event);
@@ -194,9 +194,9 @@ impl DocWithSyncKv {
         true
     }
 
-    /// Update the state vector for a subdocument in this document's metadata index.
-    /// Also seeds the last-seen timestamp so new entries aren't immediately eligible for GC.
-    pub fn update_subdoc_state_vector(&self, subdoc_id: &str, encoded_sv: Vec<u8>) {
+    /// Update the snapshot for a subdocument in this document's metadata index.
+    /// Also records when the subdocument was last edited.
+    pub fn update_subdoc_snapshot(&self, subdoc_id: &str, encoded_snapshot: Vec<u8>) {
         let mut metadata = self.sync_kv.get_metadata().unwrap_or_default();
 
         let subdocs = metadata
@@ -207,32 +207,53 @@ impl DocWithSyncKv {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-
-        let entry_value = ciborium::value::Value::Map(vec![
-            (
-                ciborium::value::Value::Text("state_vector".to_string()),
-                ciborium::value::Value::Bytes(encoded_sv),
-            ),
-            (
-                ciborium::value::Value::Text("last_seen".to_string()),
-                ciborium::value::Value::Integer(now.into()),
-            ),
-        ]);
+        let snapshot_value = ciborium::value::Value::Bytes(encoded_snapshot);
+        let last_edit_value = ciborium::value::Value::Integer(now.into());
 
         if let ciborium::value::Value::Map(ref mut entries) = subdocs {
             let key = ciborium::value::Value::Text(subdoc_id.to_string());
-            if let Some(entry) = entries.iter_mut().find(|(k, _)| *k == key) {
-                entry.1 = entry_value;
+            if let Some((_, entry_value)) = entries.iter_mut().find(|(k, _)| *k == key) {
+                if let ciborium::value::Value::Map(fields) = entry_value {
+                    fields.retain(|(k, _)| {
+                        *k != ciborium::value::Value::Text("last_seen".to_string())
+                            && *k != ciborium::value::Value::Text("state_vector".to_string())
+                    });
+                    upsert_cbor_field(fields, "snapshot", snapshot_value);
+                    upsert_cbor_field(fields, "last_edit", last_edit_value);
+                } else {
+                    *entry_value = ciborium::value::Value::Map(vec![
+                        (
+                            ciborium::value::Value::Text("snapshot".to_string()),
+                            snapshot_value,
+                        ),
+                        (
+                            ciborium::value::Value::Text("last_edit".to_string()),
+                            last_edit_value,
+                        ),
+                    ]);
+                }
             } else {
-                entries.push((key, entry_value));
+                entries.push((
+                    key,
+                    ciborium::value::Value::Map(vec![
+                        (
+                            ciborium::value::Value::Text("snapshot".to_string()),
+                            snapshot_value,
+                        ),
+                        (
+                            ciborium::value::Value::Text("last_edit".to_string()),
+                            last_edit_value,
+                        ),
+                    ]),
+                ));
             }
         }
 
         self.sync_kv.set_metadata(metadata);
     }
 
-    /// Get the subdocument state vector index from metadata.
-    pub fn get_subdoc_state_vectors(&self) -> Option<Vec<(String, Vec<u8>)>> {
+    /// Get the subdocument snapshot index from metadata.
+    pub fn get_subdoc_snapshots(&self) -> Option<Vec<(String, Vec<u8>)>> {
         let metadata = self.sync_kv.get_metadata()?;
         let subdocs = metadata.get("subdocs")?;
 
@@ -244,11 +265,11 @@ impl DocWithSyncKv {
                         for (fk, fv) in fields {
                             if let (
                                 ciborium::value::Value::Text(fname),
-                                ciborium::value::Value::Bytes(sv_bytes),
+                                ciborium::value::Value::Bytes(snapshot_bytes),
                             ) = (fk, fv)
                             {
-                                if fname == "state_vector" {
-                                    result.push((doc_id.clone(), sv_bytes.clone()));
+                                if fname == "snapshot" {
+                                    result.push((doc_id.clone(), snapshot_bytes.clone()));
                                 }
                             }
                         }
@@ -262,12 +283,27 @@ impl DocWithSyncKv {
     }
 }
 
+fn upsert_cbor_field(
+    fields: &mut Vec<(ciborium::value::Value, ciborium::value::Value)>,
+    key: &str,
+    value: ciborium::value::Value,
+) {
+    let key = ciborium::value::Value::Text(key.to_string());
+    if let Some((_, existing)) = fields.iter_mut().find(|(k, _)| *k == key) {
+        *existing = value;
+    } else {
+        fields.push((key, value));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Store;
     use async_trait::async_trait;
     use dashmap::DashMap;
+    use std::collections::BTreeMap;
+    use yrs::Text;
 
     #[derive(Default, Clone)]
     struct MemoryStore {
@@ -297,42 +333,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_subdoc_state_vector_roundtrip() {
+    async fn test_subdoc_snapshot_roundtrip() {
         let store = MemoryStore::default();
         let dwskv = DocWithSyncKv::new("parent_doc", Some(Arc::new(Box::new(store))), || (), None)
             .await
             .unwrap();
 
-        // Initially no subdoc state vectors
-        assert!(dwskv.get_subdoc_state_vectors().is_none());
+        // Initially no subdoc snapshots
+        assert!(dwskv.get_subdoc_snapshots().is_none());
 
-        // Add a subdoc state vector
-        dwskv.update_subdoc_state_vector("subdoc-abc", vec![1, 2, 3, 4]);
+        // Add a subdoc snapshot
+        dwskv.update_subdoc_snapshot("subdoc-abc", vec![1, 2, 3, 4]);
 
-        let svs = dwskv.get_subdoc_state_vectors().unwrap();
-        assert_eq!(svs.len(), 1);
-        assert_eq!(svs[0], ("subdoc-abc".to_string(), vec![1, 2, 3, 4]));
+        let snapshots = dwskv.get_subdoc_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0], ("subdoc-abc".to_string(), vec![1, 2, 3, 4]));
 
         // Add another subdoc
-        dwskv.update_subdoc_state_vector("subdoc-def", vec![5, 6, 7, 8]);
+        dwskv.update_subdoc_snapshot("subdoc-def", vec![5, 6, 7, 8]);
 
-        let svs = dwskv.get_subdoc_state_vectors().unwrap();
-        assert_eq!(svs.len(), 2);
+        let snapshots = dwskv.get_subdoc_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 2);
 
         // Update existing subdoc — should replace, not duplicate
-        dwskv.update_subdoc_state_vector("subdoc-abc", vec![10, 20, 30]);
+        dwskv.update_subdoc_snapshot("subdoc-abc", vec![10, 20, 30]);
 
-        let svs = dwskv.get_subdoc_state_vectors().unwrap();
-        assert_eq!(svs.len(), 2);
-        let abc = svs.iter().find(|(id, _)| id == "subdoc-abc").unwrap();
+        let snapshots = dwskv.get_subdoc_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        let abc = snapshots.iter().find(|(id, _)| id == "subdoc-abc").unwrap();
         assert_eq!(abc.1, vec![10, 20, 30]);
     }
 
     #[tokio::test]
-    async fn test_subdoc_state_vectors_persist() {
+    async fn test_subdoc_snapshots_persist() {
         let store = MemoryStore::default();
 
-        // Create parent, add subdoc state vectors, persist
+        // Create parent, add subdoc snapshots, persist
         {
             let dwskv = DocWithSyncKv::new(
                 "parent_doc",
@@ -343,12 +379,12 @@ mod tests {
             .await
             .unwrap();
 
-            dwskv.update_subdoc_state_vector("subdoc-1", vec![1, 2, 3]);
-            dwskv.update_subdoc_state_vector("subdoc-2", vec![4, 5, 6]);
+            dwskv.update_subdoc_snapshot("subdoc-1", vec![1, 2, 3]);
+            dwskv.update_subdoc_snapshot("subdoc-2", vec![4, 5, 6]);
             dwskv.sync_kv().persist().await.unwrap();
         }
 
-        // Reload and verify state vectors survived
+        // Reload and verify snapshots survived
         {
             let dwskv = DocWithSyncKv::new(
                 "parent_doc",
@@ -359,19 +395,58 @@ mod tests {
             .await
             .unwrap();
 
-            let svs = dwskv.get_subdoc_state_vectors().unwrap();
-            assert_eq!(svs.len(), 2);
+            let snapshots = dwskv.get_subdoc_snapshots().unwrap();
+            assert_eq!(snapshots.len(), 2);
 
-            let s1 = svs.iter().find(|(id, _)| id == "subdoc-1").unwrap();
+            let s1 = snapshots.iter().find(|(id, _)| id == "subdoc-1").unwrap();
             assert_eq!(s1.1, vec![1, 2, 3]);
 
-            let s2 = svs.iter().find(|(id, _)| id == "subdoc-2").unwrap();
+            let s2 = snapshots.iter().find(|(id, _)| id == "subdoc-2").unwrap();
             assert_eq!(s2.1, vec![4, 5, 6]);
         }
     }
 
     #[tokio::test]
-    async fn test_subdoc_last_seen_seeded_on_update() {
+    async fn test_update_event_snapshot_includes_delete_set() {
+        let store = MemoryStore::default();
+        let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let snapshots_for_callback = snapshots.clone();
+        let callback: WebhookCallback = Arc::new(move |event| {
+            if let Some(snapshot) = event.snapshot {
+                snapshots_for_callback.lock().unwrap().push(snapshot);
+            }
+        });
+
+        let dwskv = DocWithSyncKv::new(
+            "subdoc",
+            Some(Arc::new(Box::new(store))),
+            || (),
+            Some(callback),
+        )
+        .await
+        .unwrap();
+
+        let awareness = dwskv.awareness();
+        {
+            let guard = awareness.read().unwrap();
+            let text = guard.doc().get_or_insert_text("body");
+            let mut txn = guard.doc().transact_mut();
+            text.insert(&mut txn, 0, "abc");
+        }
+        {
+            let guard = awareness.read().unwrap();
+            let text = guard.doc().get_or_insert_text("body");
+            let mut txn = guard.doc().transact_mut();
+            text.remove_range(&mut txn, 1, 1);
+        }
+
+        let encoded_snapshot = snapshots.lock().unwrap().last().cloned().unwrap();
+        let snapshot = yrs::Snapshot::decode_v1(&encoded_snapshot).unwrap();
+        assert!(!snapshot.delete_set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_subdoc_last_edit_seeded_on_update() {
         let store = MemoryStore::default();
         let dwskv = DocWithSyncKv::new("parent_doc", Some(Arc::new(Box::new(store))), || (), None)
             .await
@@ -382,7 +457,7 @@ mod tests {
             .unwrap()
             .as_millis() as u64;
 
-        dwskv.update_subdoc_state_vector("subdoc-abc", vec![1, 2, 3]);
+        dwskv.update_subdoc_snapshot("subdoc-abc", vec![1, 2, 3]);
 
         let metadata = dwskv.sync_kv().get_metadata().unwrap();
         let subdocs = metadata.get("subdocs").unwrap();
@@ -391,23 +466,27 @@ mod tests {
             let (k, v) = &entries[0];
             assert_eq!(*k, ciborium::value::Value::Text("subdoc-abc".to_string()));
             if let ciborium::value::Value::Map(fields) = v {
-                // Check state_vector
-                let sv = fields
+                // Check snapshot
+                let snapshot = fields
                     .iter()
-                    .find(|(k, _)| *k == ciborium::value::Value::Text("state_vector".to_string()))
+                    .find(|(k, _)| *k == ciborium::value::Value::Text("snapshot".to_string()))
                     .unwrap();
-                assert_eq!(sv.1, ciborium::value::Value::Bytes(vec![1, 2, 3]));
-                // Check last_seen
-                let ls = fields
+                assert_eq!(snapshot.1, ciborium::value::Value::Bytes(vec![1, 2, 3]));
+                // Check last_edit
+                let le = fields
                     .iter()
-                    .find(|(k, _)| *k == ciborium::value::Value::Text("last_seen".to_string()))
+                    .find(|(k, _)| *k == ciborium::value::Value::Text("last_edit".to_string()))
                     .unwrap();
-                if let ciborium::value::Value::Integer(ts) = &ls.1 {
+                if let ciborium::value::Value::Integer(ts) = &le.1 {
                     let ts: u64 = (*ts).try_into().unwrap();
                     assert!(ts >= before);
                 } else {
                     panic!("Expected Integer timestamp");
                 }
+                assert!(fields.iter().all(|(k, _)| {
+                    *k != ciborium::value::Value::Text("last_seen".to_string())
+                        && *k != ciborium::value::Value::Text("last_query".to_string())
+                }));
             } else {
                 panic!("Expected Map for subdoc entry");
             }
@@ -417,21 +496,89 @@ mod tests {
 
         // Second update should refresh the timestamp, not duplicate the entry
         std::thread::sleep(std::time::Duration::from_millis(2));
-        dwskv.update_subdoc_state_vector("subdoc-abc", vec![4, 5, 6]);
+        dwskv.update_subdoc_snapshot("subdoc-abc", vec![4, 5, 6]);
 
         let metadata = dwskv.sync_kv().get_metadata().unwrap();
         let subdocs = metadata.get("subdocs").unwrap();
         if let ciborium::value::Value::Map(entries) = subdocs {
             assert_eq!(entries.len(), 1);
             if let ciborium::value::Value::Map(fields) = &entries[0].1 {
-                let sv = fields
+                let snapshot = fields
                     .iter()
-                    .find(|(k, _)| *k == ciborium::value::Value::Text("state_vector".to_string()))
+                    .find(|(k, _)| *k == ciborium::value::Value::Text("snapshot".to_string()))
                     .unwrap();
-                assert_eq!(sv.1, ciborium::value::Value::Bytes(vec![4, 5, 6]));
+                assert_eq!(snapshot.1, ciborium::value::Value::Bytes(vec![4, 5, 6]));
             }
         } else {
             panic!("Expected Map");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subdoc_snapshot_update_drops_legacy_state_vector() {
+        let store = MemoryStore::default();
+        let dwskv = DocWithSyncKv::new("parent_doc", Some(Arc::new(Box::new(store))), || (), None)
+            .await
+            .unwrap();
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "subdocs".to_string(),
+            ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Text("subdoc-abc".to_string()),
+                ciborium::value::Value::Map(vec![
+                    (
+                        ciborium::value::Value::Text("state_vector".to_string()),
+                        ciborium::value::Value::Bytes(vec![1, 2, 3]),
+                    ),
+                    (
+                        ciborium::value::Value::Text("snapshot".to_string()),
+                        ciborium::value::Value::Bytes(vec![4, 5, 6]),
+                    ),
+                    (
+                        ciborium::value::Value::Text("last_seen".to_string()),
+                        ciborium::value::Value::Integer(123.into()),
+                    ),
+                    (
+                        ciborium::value::Value::Text("last_query".to_string()),
+                        ciborium::value::Value::Integer(456.into()),
+                    ),
+                ]),
+            )]),
+        );
+        dwskv.sync_kv().set_metadata(metadata);
+
+        dwskv.update_subdoc_snapshot("subdoc-abc", vec![7, 8, 9]);
+
+        let metadata = dwskv.sync_kv().get_metadata().unwrap();
+        let subdocs = metadata.get("subdocs").unwrap();
+        if let ciborium::value::Value::Map(entries) = subdocs {
+            if let ciborium::value::Value::Map(fields) = &entries[0].1 {
+                assert_eq!(
+                    fields
+                        .iter()
+                        .find(|(k, _)| {
+                            *k == ciborium::value::Value::Text("snapshot".to_string())
+                        })
+                        .unwrap()
+                        .1,
+                    ciborium::value::Value::Bytes(vec![7, 8, 9])
+                );
+                assert!(fields
+                    .iter()
+                    .any(|(k, _)| *k == ciborium::value::Value::Text("last_edit".to_string())));
+                assert!(fields
+                    .iter()
+                    .any(|(k, _)| *k == ciborium::value::Value::Text("last_query".to_string())));
+                assert!(fields.iter().all(|(k, _)| {
+                    *k != ciborium::value::Value::Text("state_vector".to_string())
+                        && *k != ciborium::value::Value::Text("last_seen".to_string())
+                }));
+            } else {
+                panic!("Expected subdoc metadata map");
+            }
+        } else {
+            panic!("Expected subdocs map");
         }
     }
 
