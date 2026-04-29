@@ -220,6 +220,9 @@ pub const MSG_QUERY_SUBDOCS: u8 = 7;
 /// Tag id for [Message::Subdocs].
 pub const MSG_SUBDOCS: u8 = 8;
 
+/// Maximum number of subdocument GUIDs accepted in one query request.
+pub const MAX_QUERY_SUBDOCS_PER_REQUEST: usize = 100;
+
 pub const PERMISSION_DENIED: u8 = 0;
 pub const PERMISSION_GRANTED: u8 = 1;
 
@@ -232,8 +235,8 @@ pub enum Message {
     Event(Vec<u8>),                // CBOR-encoded EventMessage
     EventSubscribe(Vec<String>),   // List of event types to subscribe to
     EventUnsubscribe(Vec<String>), // List of event types to unsubscribe from
-    QuerySubdocs(Vec<String>), // Client → server: request subdoc snapshots for given guids (empty = all)
-    Subdocs(Vec<u8>),          // Server → client: CBOR map of {doc_id: snapshot_bytes}
+    QuerySubdocs(Vec<String>), // Client → server: request subdoc snapshots for a non-empty GUID batch
+    Subdocs(Vec<u8>),          // Server → client: CBOR {data: {doc_id: {snapshot, last_seen}}}
     Custom(u8, Vec<u8>),
 }
 
@@ -343,6 +346,9 @@ impl Decode for Message {
             }
             MSG_QUERY_SUBDOCS => {
                 let count: u64 = decoder.read_var()?;
+                if count == 0 || count > MAX_QUERY_SUBDOCS_PER_REQUEST as u64 {
+                    return Err(yrs::encoding::read::Error::UnexpectedValue);
+                }
                 let mut guids = Vec::with_capacity(count as usize);
                 for _ in 0..count {
                     guids.push(decoder.read_string()?.to_string());
@@ -435,6 +441,10 @@ pub enum Error {
     #[error("unsupported message tag identifier: {0}")]
     Unsupported(u8),
 
+    /// Thrown whenever a known message tag has an invalid payload.
+    #[error("invalid message: {reason}")]
+    InvalidMessage { reason: String },
+
     /// Custom dynamic kind of error, usually related to a warp internal error messages.
     #[error("internal failure: {0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
@@ -473,6 +483,7 @@ mod test {
     use crate::sync::{DefaultProtocol, MessageReader, Protocol};
     use std::collections::HashMap;
     use yrs::encoding::read::Cursor;
+    use yrs::encoding::write::Write;
     use yrs::updates::decoder::{Decode, DecoderV1};
     use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
@@ -841,9 +852,8 @@ mod test {
                 "user.joined".to_string(),
             ]),
             Message::EventUnsubscribe(vec!["user.left".to_string()]),
-            Message::QuerySubdocs(vec![]),
             Message::QuerySubdocs(vec!["subdoc-abc".to_string(), "subdoc-def".to_string()]),
-            Message::Subdocs(vec![0xa0]), // empty CBOR map
+            Message::Subdocs(vec![0xa1, 0x64, b'd', b'a', b't', b'a', 0xa0]), // CBOR {data: {}}
             Message::Custom(100, vec![1, 2, 3, 4]),
         ];
 
@@ -856,11 +866,21 @@ mod test {
     }
 
     #[test]
-    fn test_query_subdocs_message_encoding_empty() {
-        let msg = Message::QuerySubdocs(vec![]);
-        let encoded = msg.encode_v1();
-        let decoded = Message::decode_v1(&encoded).unwrap();
-        assert_eq!(decoded, Message::QuerySubdocs(vec![]));
+    fn test_query_subdocs_message_decoding_rejects_empty_request() {
+        let mut encoder = EncoderV1::new();
+        encoder.write_var(super::MSG_QUERY_SUBDOCS);
+        encoder.write_var(0usize);
+
+        assert!(Message::decode_v1(&encoder.to_vec()).is_err());
+    }
+
+    #[test]
+    fn test_query_subdocs_message_decoding_rejects_oversized_request() {
+        let mut encoder = EncoderV1::new();
+        encoder.write_var(super::MSG_QUERY_SUBDOCS);
+        encoder.write_var(super::MAX_QUERY_SUBDOCS_PER_REQUEST + 1);
+
+        assert!(Message::decode_v1(&encoder.to_vec()).is_err());
     }
 
     #[test]
@@ -873,18 +893,50 @@ mod test {
     }
 
     #[test]
+    fn test_query_subdocs_message_encoding_accepts_max_request() {
+        let guids: Vec<String> = (0..super::MAX_QUERY_SUBDOCS_PER_REQUEST)
+            .map(|idx| format!("subdoc-{}", idx))
+            .collect();
+        let msg = Message::QuerySubdocs(guids.clone());
+        let encoded = msg.encode_v1();
+        let decoded = Message::decode_v1(&encoded).unwrap();
+        assert_eq!(decoded, Message::QuerySubdocs(guids));
+    }
+
+    #[test]
     fn test_subdocs_message_encoding() {
-        // Build a CBOR map with subdoc snapshots
-        let cbor_map = ciborium::value::Value::Map(vec![
-            (
-                ciborium::value::Value::Text("subdoc-abc".to_string()),
-                ciborium::value::Value::Bytes(vec![1, 2, 3, 4]),
-            ),
-            (
-                ciborium::value::Value::Text("subdoc-def".to_string()),
-                ciborium::value::Value::Bytes(vec![5, 6, 7, 8]),
-            ),
-        ]);
+        // Build a CBOR envelope with subdoc snapshots.
+        let cbor_map = ciborium::value::Value::Map(vec![(
+            ciborium::value::Value::Text("data".to_string()),
+            ciborium::value::Value::Map(vec![
+                (
+                    ciborium::value::Value::Text("subdoc-abc".to_string()),
+                    ciborium::value::Value::Map(vec![
+                        (
+                            ciborium::value::Value::Text("snapshot".to_string()),
+                            ciborium::value::Value::Bytes(vec![1, 2, 3, 4]),
+                        ),
+                        (
+                            ciborium::value::Value::Text("last_seen".to_string()),
+                            ciborium::value::Value::Integer(123.into()),
+                        ),
+                    ]),
+                ),
+                (
+                    ciborium::value::Value::Text("subdoc-def".to_string()),
+                    ciborium::value::Value::Map(vec![
+                        (
+                            ciborium::value::Value::Text("snapshot".to_string()),
+                            ciborium::value::Value::Bytes(vec![5, 6, 7, 8]),
+                        ),
+                        (
+                            ciborium::value::Value::Text("last_seen".to_string()),
+                            ciborium::value::Value::Integer(456.into()),
+                        ),
+                    ]),
+                ),
+            ]),
+        )]);
         let mut cbor_bytes = Vec::new();
         ciborium::ser::into_writer(&cbor_map, &mut cbor_bytes).unwrap();
 
