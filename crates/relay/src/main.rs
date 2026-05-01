@@ -230,6 +230,52 @@ enum DocCommand {
         #[clap(short = 'o', long)]
         output: Option<PathBuf>,
     },
+
+    /// Restore supported document roots from a historical version by writing
+    /// fresh Yjs operations into the current doc.
+    Restore {
+        #[clap(flatten)]
+        args: DocRestoreArgs,
+    },
+}
+
+#[derive(Args)]
+struct DocRestoreArgs {
+    /// Path to relay.toml (defaults to standard discovery).
+    #[clap(short = 'c', long = "config")]
+    config: Option<PathBuf>,
+
+    /// Store URL override: `s3://bucket[/prefix]` or a filesystem path.
+    #[clap(long)]
+    store: Option<String>,
+
+    /// Relay GUID prefix used to construct the storage key.
+    #[clap(long = "relay")]
+    relay_id: String,
+
+    /// Doc GUID to restore.
+    #[clap(long)]
+    doc: String,
+
+    /// Specific S3 VersionId to restore supported roots from.
+    #[clap(long = "from-version")]
+    from_version: String,
+
+    /// Restore only this top-level root. Repeat for multiple roots.
+    #[clap(long, conflicts_with = "except")]
+    only: Vec<String>,
+
+    /// Exclude this top-level root. Repeat for multiple roots.
+    #[clap(long)]
+    except: Vec<String>,
+
+    /// Persist the restored roots. Without this flag, this is a dry run.
+    #[clap(long, conflicts_with = "verify")]
+    write: bool,
+
+    /// Verify current root entries and writer client clocks against source.
+    #[clap(long, conflicts_with = "write")]
+    verify: bool,
 }
 
 #[derive(Subcommand)]
@@ -1254,6 +1300,31 @@ async fn main() -> Result<()> {
                         std::io::stdout().write_all(&bytes)?;
                     }
                 }
+            }
+            DocCommand::Restore { args } => {
+                let DocRestoreArgs {
+                    config,
+                    store,
+                    relay_id,
+                    doc,
+                    from_version,
+                    only,
+                    except,
+                    write,
+                    verify,
+                } = args;
+                let store = build_store_for_subcommand(store.as_deref(), config.as_ref())?;
+                relay::doc_restore::run(
+                    store,
+                    relay_id,
+                    doc,
+                    from_version,
+                    only,
+                    except,
+                    *write,
+                    *verify,
+                )
+                .await?;
             }
         },
 

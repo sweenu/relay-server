@@ -1,4 +1,4 @@
-use super::{FileInfo, Result, StoreError, VersionInfo};
+use super::{FileInfo, LeasedValue, Result, StoreError, VersionInfo, WriteLease};
 use crate::metrics::RelayMetrics;
 use crate::store::Store;
 use async_trait::async_trait;
@@ -201,9 +201,24 @@ impl S3Store {
         action: A,
         body: Option<Vec<u8>>,
     ) -> Result<Response> {
+        self.store_request_with_headers(method, action, body, &[])
+            .await
+    }
+
+    async fn store_request_with_headers<'a, A: S3Action<'a>>(
+        &self,
+        method: Method,
+        action: A,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> Result<Response> {
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
         let method_label = method.as_str().to_string();
         let mut request = self.client.request(method, url);
+
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
 
         request = if let Some(body) = body {
             request.body(body.to_vec())
@@ -250,6 +265,12 @@ impl S3Store {
                     "Received UNAUTHORIZED from S3-compatible API.".to_string(),
                 ))
             }
+            StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
+                record("lease_conflict");
+                Err(StoreError::LeaseConflict(
+                    "S3 object changed before conditional write".to_string(),
+                ))
+            }
             _ => {
                 record("other_error");
                 Err(StoreError::ConnectionError(format!(
@@ -258,6 +279,14 @@ impl S3Store {
                 )))
             }
         }
+    }
+
+    fn response_etag(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string())
     }
 
     async fn read_response_bytes(response: Response) -> Result<Bytes> {
@@ -343,6 +372,35 @@ impl S3Store {
         }
     }
 
+    async fn get_with_lease(&self, key: &str) -> Result<LeasedValue> {
+        self.init().await?;
+        let prefixed_key = self.prefixed_key(key);
+        let object_get = self
+            .bucket
+            .get_object(Some(&self.credentials), &prefixed_key);
+        let response = self.store_request(Method::GET, object_get, None).await;
+
+        match response {
+            Ok(response) => {
+                let etag = Self::response_etag(&response);
+                let result = Self::read_response_bytes(response).await?;
+                let value = result.to_vec();
+                let lease = etag
+                    .map(|token| WriteLease::Opaque {
+                        backend: "s3-etag".to_string(),
+                        token,
+                    })
+                    .unwrap_or_else(|| WriteLease::for_value(Some(&value)));
+                Ok(LeasedValue {
+                    value: Some(value),
+                    lease,
+                })
+            }
+            Err(StoreError::DoesNotExist(_)) => Ok(LeasedValue::from_value(None)),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn get_version(&self, key: &str, version_id: &str) -> Result<Option<Vec<u8>>> {
         use rusty_s3::S3Action;
         self.init().await?;
@@ -374,6 +432,63 @@ impl S3Store {
             .put_object(Some(&self.credentials), &prefixed_key);
         self.store_request(Method::PUT, action, Some(value)).await?;
         Ok(())
+    }
+
+    async fn set_if_unchanged(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        lease: &WriteLease,
+    ) -> Result<WriteLease> {
+        match lease {
+            WriteLease::Opaque { backend, token } if backend == "s3-etag" => {
+                self.init().await?;
+                let prefixed_key = self.prefixed_key(key);
+                let mut action = self
+                    .bucket
+                    .put_object(Some(&self.credentials), &prefixed_key);
+                action.headers_mut().insert("if-match", token.clone());
+                let headers = [("if-match", token.as_str())];
+                let response = self
+                    .store_request_with_headers(Method::PUT, action, Some(value.clone()), &headers)
+                    .await?;
+                Ok(Self::response_etag(&response)
+                    .map(|token| WriteLease::Opaque {
+                        backend: "s3-etag".to_string(),
+                        token,
+                    })
+                    .unwrap_or_else(|| WriteLease::for_value(Some(&value))))
+            }
+            WriteLease::Missing => {
+                self.init().await?;
+                let prefixed_key = self.prefixed_key(key);
+                let mut action = self
+                    .bucket
+                    .put_object(Some(&self.credentials), &prefixed_key);
+                action.headers_mut().insert("if-none-match", "*");
+                let headers = [("if-none-match", "*")];
+                let response = self
+                    .store_request_with_headers(Method::PUT, action, Some(value.clone()), &headers)
+                    .await?;
+                Ok(Self::response_etag(&response)
+                    .map(|token| WriteLease::Opaque {
+                        backend: "s3-etag".to_string(),
+                        token,
+                    })
+                    .unwrap_or_else(|| WriteLease::for_value(Some(&value))))
+            }
+            _ => {
+                let current = self.get_with_lease(key).await?;
+                if !lease.matches(&current) {
+                    return Err(StoreError::LeaseConflict(format!(
+                        "{} changed since it was read",
+                        key
+                    )));
+                }
+                self.set(key, value.clone()).await?;
+                Ok(WriteLease::for_value(Some(&value)))
+            }
+        }
     }
 
     async fn remove(&self, key: &str) -> Result<()> {
@@ -412,12 +527,25 @@ impl Store for S3Store {
         self.get(key).await
     }
 
+    async fn get_with_lease(&self, key: &str) -> Result<LeasedValue> {
+        self.get_with_lease(key).await
+    }
+
     async fn get_version(&self, key: &str, version_id: &str) -> Result<Option<Vec<u8>>> {
         self.get_version(key, version_id).await
     }
 
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
         self.set(key, value).await
+    }
+
+    async fn set_if_unchanged(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        lease: &WriteLease,
+    ) -> Result<WriteLease> {
+        self.set_if_unchanged(key, value, lease).await
     }
 
     async fn remove(&self, key: &str) -> Result<()> {

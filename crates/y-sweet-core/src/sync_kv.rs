@@ -1,4 +1,4 @@
-use crate::store::Store;
+use crate::store::{Store, WriteLease};
 use anyhow::{Context, Result};
 use ciborium;
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,7 @@ pub struct SyncKv {
     dirty_callback: Box<dyn Fn() + Send + Sync>,
     shutdown: AtomicBool,
     created_at: Option<u64>,
+    write_lease: Arc<Mutex<Option<WriteLease>>>,
     metadata: Arc<Mutex<Option<BTreeMap<String, ciborium::value::Value>>>>,
 }
 
@@ -127,9 +128,16 @@ impl SyncKv {
         let key = format!("{}/data.ysweet", key);
         let mut created_at = None;
         let mut metadata = None;
+        let mut write_lease = None;
 
         let data = if let Some(store) = &store {
-            if let Some(snapshot) = store.get(&key).await.context("Failed to get from store.")? {
+            let leased = store
+                .get_with_lease(&key)
+                .await
+                .context("Failed to get from store.")?;
+            write_lease = Some(leased.lease);
+
+            if let Some(snapshot) = leased.value {
                 tracing::info!(size=?snapshot.len(), "Loading snapshot");
 
                 // Try CBOR format first
@@ -172,6 +180,7 @@ impl SyncKv {
             dirty_callback: Box::new(callback),
             shutdown: AtomicBool::new(false),
             created_at,
+            write_lease: Arc::new(Mutex::new(write_lease)),
             metadata: Arc::new(Mutex::new(metadata)),
         })
     }
@@ -213,6 +222,7 @@ impl SyncKv {
             dirty_callback: Box::new(|| ()),
             shutdown: AtomicBool::new(false),
             created_at,
+            write_lease: Arc::new(Mutex::new(None)),
             metadata: Arc::new(Mutex::new(metadata)),
         };
         Ok((inst, modified_at))
@@ -226,6 +236,17 @@ impl SyncKv {
     }
 
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.persist_inner(false).await
+    }
+
+    /// Persist this document only if the backing object still matches the
+    /// lease captured when it was loaded. This is intended for offline tools
+    /// that should not overwrite a document changed by a live writer.
+    pub async fn persist_if_unchanged(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.persist_inner(true).await
+    }
+
+    async fn persist_inner(&self, require_lease: bool) -> Result<(), Box<dyn std::error::Error>> {
         if !self.dirty.swap(false, Ordering::Relaxed) {
             return Ok(());
         }
@@ -251,10 +272,32 @@ impl SyncKv {
             };
 
             tracing::info!(size=?snapshot.len(), "Persisting CBOR snapshot");
-            if let Err(e) = store.set(&self.key, snapshot).await {
-                // Re-mark as dirty so the next cycle retries.
-                self.dirty.store(true, Ordering::Relaxed);
-                return Err(e.into());
+            let result = if require_lease {
+                let lease = self.write_lease.lock().unwrap().clone().ok_or_else(|| {
+                    crate::store::StoreError::UnsupportedOperation(format!(
+                        "No write lease available for {}",
+                        self.key
+                    ))
+                })?;
+                store
+                    .set_if_unchanged(&self.key, snapshot.clone(), &lease)
+                    .await
+            } else {
+                store
+                    .set(&self.key, snapshot.clone())
+                    .await
+                    .map(|_| WriteLease::for_value(Some(&snapshot)))
+            };
+
+            match result {
+                Ok(new_lease) => {
+                    *self.write_lease.lock().unwrap() = Some(new_lease);
+                }
+                Err(e) => {
+                    // Re-mark as dirty so the next cycle retries.
+                    self.dirty.store(true, Ordering::Relaxed);
+                    return Err(e.into());
+                }
             }
         }
         Ok(())
@@ -513,6 +556,70 @@ mod test {
 
             assert_eq!(sync_kv.get(b"foo"), Some(b"bar".to_vec()));
         }
+    }
+
+    #[tokio::test]
+    async fn persist_if_unchanged_writes_with_matching_lease() {
+        let store = MemoryStore::default();
+
+        {
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "leased", || ())
+                .await
+                .unwrap();
+
+            sync_kv.set(b"foo", b"bar");
+            sync_kv.persist_if_unchanged().await.unwrap();
+        }
+
+        {
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "leased", || ())
+                .await
+                .unwrap();
+
+            assert_eq!(sync_kv.get(b"foo"), Some(b"bar".to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_if_unchanged_rejects_concurrent_write() {
+        let store = MemoryStore::default();
+        let storage_key = "leased_conflict/data.ysweet";
+
+        let initial = SyncKv::new(
+            Some(Arc::new(Box::new(store.clone()))),
+            "leased_conflict",
+            || (),
+        )
+        .await
+        .unwrap();
+        initial.set(b"foo", b"initial");
+        initial.persist().await.unwrap();
+
+        let writer = SyncKv::new(
+            Some(Arc::new(Box::new(store.clone()))),
+            "leased_conflict",
+            || (),
+        )
+        .await
+        .unwrap();
+
+        let concurrent = SyncKv::new(
+            Some(Arc::new(Box::new(store.clone()))),
+            "leased_conflict",
+            || (),
+        )
+        .await
+        .unwrap();
+        concurrent.set(b"foo", b"concurrent");
+        concurrent.persist().await.unwrap();
+        let concurrent_bytes = store.data.get(storage_key).unwrap().clone();
+
+        writer.set(b"foo", b"writer");
+        let err = writer.persist_if_unchanged().await.unwrap_err();
+
+        assert!(err.to_string().contains("Write lease conflict"));
+        assert_eq!(*store.data.get(storage_key).unwrap(), concurrent_bytes);
+        assert!(writer.dirty.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

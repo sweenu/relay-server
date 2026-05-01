@@ -200,12 +200,12 @@ pub async fn run_backfill(
     if dry_run {
         eprintln!("DRY RUN: skipping persist of parent folder.");
     } else {
-        eprintln!("persisting parent folder...");
+        eprintln!("persisting parent folder with write lease...");
         folder
             .sync_kv()
-            .persist()
+            .persist_if_unchanged()
             .await
-            .map_err(|e| anyhow!("persist failed: {e}"))?;
+            .map_err(|e| anyhow!("lease-protected persist failed: {e}"))?;
         eprintln!("persist complete");
     }
 
