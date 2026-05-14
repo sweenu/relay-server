@@ -30,7 +30,10 @@ use std::{
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
-    sync::mpsc::{channel, Receiver},
+    sync::{
+        mpsc::{channel, Receiver},
+        Mutex as AsyncMutex,
+    },
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{span, Instrument, Level};
@@ -220,6 +223,10 @@ struct FileDownloadParams {
 
 pub struct Server {
     docs: Arc<DashMap<String, DocWithSyncKv>>,
+    /// Per-doc-id async locks held only across the load-from-store step
+    /// so concurrent first-time requests for the same doc don't both load
+    /// from the store and clobber each other in `docs`.
+    loading_locks: Arc<DashMap<String, Arc<AsyncMutex<()>>>>,
     doc_worker_tracker: TaskTracker,
     store: Option<Arc<Box<dyn Store>>>,
     checkpoint_freq: Duration,
@@ -286,6 +293,7 @@ impl Server {
 
         Ok(Self {
             docs: Arc::new(DashMap::new()),
+            loading_locks: Arc::new(DashMap::new()),
             doc_worker_tracker: TaskTracker::new(),
             store: store.map(Arc::new),
             checkpoint_freq,
@@ -605,10 +613,7 @@ impl Server {
         &self,
         doc_id: &str,
     ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
-        if !self.docs.contains_key(doc_id) {
-            tracing::info!(doc_id=?doc_id, "Loading doc");
-            self.load_doc(doc_id, None).await?;
-        }
+        self.ensure_doc_loaded(doc_id, None, None).await?;
 
         Ok(self
             .docs
@@ -632,17 +637,51 @@ impl Server {
         routing_channel: Option<String>,
         user: Option<String>,
     ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
-        if !self.docs.contains_key(doc_id) {
-            tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc with channel and user");
-            self.load_doc_with_user(doc_id, routing_channel, user)
-                .await?;
-        }
+        self.ensure_doc_loaded(doc_id, routing_channel, user)
+            .await?;
 
         Ok(self
             .docs
             .get(doc_id)
             .ok_or_else(|| anyhow!("Failed to get-or-create doc"))?
             .map(|d| d))
+    }
+
+    /// Idempotently load `doc_id` into `self.docs`. Concurrent callers for
+    /// the same doc_id serialize through a per-key async mutex so that only
+    /// one `load_doc` actually hits the store; the others observe the
+    /// already-loaded entry on a double-check after the lock is acquired.
+    async fn ensure_doc_loaded(
+        &self,
+        doc_id: &str,
+        routing_channel: Option<String>,
+        user: Option<String>,
+    ) -> Result<()> {
+        if self.docs.contains_key(doc_id) {
+            return Ok(());
+        }
+
+        // Acquire (or create) the per-key lock without holding the DashMap
+        // shard guard across the `.lock().await` below.
+        let lock = {
+            let entry = self
+                .loading_locks
+                .entry(doc_id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())));
+            Arc::clone(entry.value())
+        };
+        let _guard = lock.lock().await;
+
+        // Double-check after acquiring the lock: another caller may have
+        // loaded while we were waiting.
+        if self.docs.contains_key(doc_id) {
+            return Ok(());
+        }
+
+        tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+        self.load_doc_with_user(doc_id, routing_channel, user)
+            .await?;
+        Ok(())
     }
 
     pub fn check_auth(
