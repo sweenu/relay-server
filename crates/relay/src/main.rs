@@ -101,6 +101,24 @@ enum ServSubcommand {
 
         #[clap(long, value_delimiter = ',')]
         allowed_hosts: Option<Vec<String>>,
+
+        /// Run pending data migrations before binding the listener. If any
+        /// migration fails, the server will not start. Useful for baking
+        /// migrations into a single-tenant container image's entrypoint.
+        #[clap(long)]
+        migrate: bool,
+    },
+
+    /// Run any pending data migrations against the configured store, then exit.
+    Migrate {
+        /// Path to relay.toml (defaults to standard discovery).
+        #[clap(short = 'c', long = "config")]
+        config: Option<PathBuf>,
+
+        /// Store URL override: `s3://bucket[/prefix]` or a filesystem path.
+        /// If omitted, the configured store from relay.toml/env is used.
+        #[clap(long)]
+        store: Option<String>,
     },
 
     GenAuth {
@@ -761,6 +779,7 @@ async fn main() -> Result<()> {
         auth,
         url,
         allowed_hosts,
+        migrate: _,
     } = &opts.subcmd
     {
         loaded_serve_config = Some(load_config_for_serve_args(
@@ -794,7 +813,7 @@ async fn main() -> Result<()> {
         .init();
 
     match &opts.subcmd {
-        ServSubcommand::Serve { .. } => {
+        ServSubcommand::Serve { migrate, .. } => {
             let config = loaded_serve_config
                 .take()
                 .expect("serve config should be loaded before tracing initialization");
@@ -841,6 +860,18 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+
+            // Run pending migrations first if requested. We build a
+            // throwaway store handle for this so we don't have to share
+            // ownership with the long-lived server store below.
+            if *migrate {
+                let migrate_store = get_store_from_config(&config.store)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--migrate requires a persistent store; in-memory store has nothing to migrate"
+                    )
+                })?;
+                relay::migrations::run_pending(Arc::new(migrate_store)).await?;
+            }
 
             // Create store from config
             let store = if let Some(store) = get_store_from_config(&config.store)? {
@@ -1207,6 +1238,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        ServSubcommand::Migrate { config, store } => {
+            let store = build_store_for_subcommand(store.as_deref(), config.as_ref())?;
+            relay::migrations::run_pending(store).await?;
         }
         ServSubcommand::Sign { auth } => {
             let authenticator = Authenticator::new(auth)?;
