@@ -919,7 +919,9 @@ fn skip_v1_content(
         }
         4 => {
             let buf = cursor.read_buf().map_err(|err| format!("{:?}", err))?;
-            Ok(buf.len() as u32)
+            let s = std::str::from_utf8(buf).map_err(|err| format!("utf-8: {}", err))?;
+            let utf16_units = s.chars().map(|c| c.len_utf16()).sum::<usize>();
+            Ok(utf16_units as u32)
         }
         5 => {
             cursor.read_buf().map_err(|err| format!("{:?}", err))?;
@@ -1004,4 +1006,42 @@ fn skip_any_value(cursor: &mut lib0::decoding::Cursor) -> std::result::Result<()
         other => return Err(format!("unknown Any tag: {}", other)),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lib0::encoding::Write;
+    use yrs::{ReadTxn, StateVector, Text, Transact};
+
+    #[test]
+    fn content_string_len_is_utf16_code_units() {
+        let text = "\u{1f680}";
+        let mut encoded = Vec::new();
+        encoded.write_buf(text.as_bytes());
+
+        let mut cursor = lib0::decoding::Cursor::new(&encoded);
+        let len = skip_v1_content(&mut cursor, 4).unwrap();
+
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn decode_v1_item_parents_uses_utf16_string_clocks() {
+        let text_content = "\u{1f680}";
+        let doc = Doc::with_client_id(1);
+        let text = doc.get_or_insert_text("text");
+        text.push(&mut doc.transact_mut(), text_content);
+
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let items = decode_v1_item_parents(&update).unwrap();
+
+        assert!(
+            items.iter().any(|item| item.client == 1 && item.len == 2),
+            "decoded items: {:?}",
+            items
+        );
+    }
 }
