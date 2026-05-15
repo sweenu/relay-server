@@ -1,4 +1,4 @@
-use super::{FileInfo, LeasedValue, Result, StoreError, VersionInfo, WriteLease};
+use super::{FileInfo, FileListPage, LeasedValue, Result, StoreError, VersionInfo, WriteLease};
 use crate::metrics::RelayMetrics;
 use crate::store::Store;
 use async_trait::async_trait;
@@ -120,6 +120,14 @@ pub struct S3Store {
     client: Client,
     pub credentials: Credentials,
     prefix: Option<String>,
+}
+
+#[derive(Debug)]
+struct ListObjectsPage {
+    files: Vec<FileInfo>,
+    common_prefixes: Vec<String>,
+    truncated: bool,
+    next_continuation_token: Option<String>,
 }
 
 impl S3Store {
@@ -294,6 +302,231 @@ impl S3Store {
             Ok(bytes) => Ok(bytes),
             Err(e) => Err(StoreError::ConnectionError(e.to_string())),
         }
+    }
+
+    /// Parse a `ListObjectsV2` XML response. Keys and common prefixes are
+    /// returned with the bucket's configured `storage_prefix` stripped so that
+    /// they match the keys callers use for `get`/`set`.
+    fn parse_list_response(text: &str, storage_prefix: Option<&str>) -> Result<ListObjectsPage> {
+        let mut reader = quick_xml::Reader::from_str(text);
+        reader.trim_text(true);
+
+        let mut buf = Vec::new();
+        let mut files = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut truncated = false;
+        let mut next_continuation_token = None;
+        let mut in_contents = false;
+        let mut in_common_prefixes = false;
+        let mut current_key: Option<String> = None;
+        let mut current_size: Option<u64> = None;
+        let mut current_last_modified: Option<u64> = None;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(quick_xml::events::Event::Start(e)) => match e.name().as_ref() {
+                    b"Contents" => in_contents = true,
+                    b"CommonPrefixes" => in_common_prefixes = true,
+                    b"Key" if in_contents => {
+                        if let Ok(text) = reader.read_text(e.name()) {
+                            current_key = Some(text.to_string());
+                        }
+                    }
+                    b"Prefix" if in_common_prefixes => {
+                        if let Ok(text) = reader.read_text(e.name()) {
+                            let stripped =
+                                Self::strip_storage_prefix(text.to_string(), storage_prefix);
+                            if !stripped.is_empty() {
+                                common_prefixes.push(stripped);
+                            }
+                        }
+                    }
+                    b"Size" if in_contents => {
+                        if let Ok(text) = reader.read_text(e.name()) {
+                            current_size = text.parse::<u64>().ok();
+                        }
+                    }
+                    b"LastModified" if in_contents => {
+                        if let Ok(text) = reader.read_text(e.name()) {
+                            if let Ok(date_time) = time::OffsetDateTime::parse(
+                                &text,
+                                &time::format_description::well_known::Rfc3339,
+                            ) {
+                                current_last_modified =
+                                    Some(date_time.unix_timestamp_nanos() as u64 / 1_000_000);
+                            }
+                        }
+                    }
+                    b"IsTruncated" => {
+                        if let Ok(text) = reader.read_text(e.name()) {
+                            truncated = text.trim().eq_ignore_ascii_case("true");
+                        }
+                    }
+                    b"NextContinuationToken" => {
+                        if let Ok(text) = reader.read_text(e.name()) {
+                            next_continuation_token = Some(text.to_string());
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(quick_xml::events::Event::End(e)) => match e.name().as_ref() {
+                    b"Contents" => {
+                        in_contents = false;
+                        if let (Some(key), Some(size), Some(last_modified)) = (
+                            current_key.take(),
+                            current_size.take(),
+                            current_last_modified.take(),
+                        ) {
+                            let stripped = Self::strip_storage_prefix(key, storage_prefix);
+                            if !stripped.is_empty() {
+                                files.push(FileInfo {
+                                    key: stripped,
+                                    size,
+                                    last_modified,
+                                });
+                            }
+                        }
+                    }
+                    b"CommonPrefixes" => {
+                        in_common_prefixes = false;
+                    }
+                    _ => {}
+                },
+                Ok(quick_xml::events::Event::Eof) => break,
+                Err(e) => {
+                    return Err(StoreError::ConnectionError(format!(
+                        "Error parsing S3 list response: {}",
+                        e
+                    )));
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(ListObjectsPage {
+            files,
+            common_prefixes,
+            truncated,
+            next_continuation_token,
+        })
+    }
+
+    fn strip_storage_prefix(value: String, storage_prefix: Option<&str>) -> String {
+        match storage_prefix {
+            Some(prefix) => {
+                let prefix = prefix.trim_end_matches('/');
+                if prefix.is_empty() {
+                    value
+                } else if let Some(rest) = value.strip_prefix(&format!("{}/", prefix)) {
+                    rest.to_string()
+                } else {
+                    // Value is outside the configured prefix (unexpected); pass
+                    // through unchanged.
+                    value
+                }
+            }
+            None => value,
+        }
+    }
+
+    async fn list_objects_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+        delimiter: Option<&str>,
+    ) -> Result<FileListPage> {
+        self.init().await?;
+
+        // Apply storage prefix if configured
+        let prefixed = if let Some(path_prefix) = &self.prefix {
+            if path_prefix.ends_with('/') {
+                format!("{}{}", path_prefix, prefix)
+            } else {
+                format!("{}/{}", path_prefix, prefix)
+            }
+        } else {
+            prefix.to_string()
+        };
+
+        tracing::debug!("Listing objects with prefix: {}", prefixed);
+
+        let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+        action.with_prefix(prefixed.as_str());
+        if let Some(delimiter) = delimiter {
+            action.with_delimiter(delimiter);
+        }
+        if let Some(token) = continuation_token {
+            action.with_continuation_token(token);
+        }
+
+        let response = self.store_request(Method::GET, action, None).await?;
+        let bytes = Self::read_response_bytes(response).await?;
+        let text = String::from_utf8_lossy(&bytes);
+        let page = Self::parse_list_response(&text, self.prefix.as_deref())?;
+
+        let next_continuation_token = if page.truncated {
+            let next_token = page
+                .next_continuation_token
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| {
+                    StoreError::ConnectionError(format!(
+                        "S3 list response for prefix {} was truncated but missing NextContinuationToken",
+                        prefixed
+                    ))
+                })?;
+
+            if continuation_token == Some(next_token.as_str()) {
+                return Err(StoreError::ConnectionError(format!(
+                    "S3 list response for prefix {} repeated continuation token {}",
+                    prefixed, next_token
+                )));
+            }
+
+            Some(next_token)
+        } else {
+            None
+        };
+
+        tracing::debug!(
+            "Found {} files and {} common prefixes with prefix {} on current page",
+            page.files.len(),
+            page.common_prefixes.len(),
+            prefixed
+        );
+
+        Ok(FileListPage {
+            files: page.files,
+            common_prefixes: page.common_prefixes,
+            next_continuation_token,
+        })
+    }
+
+    async fn list_objects(&self, prefix: &str) -> Result<Vec<FileInfo>> {
+        let mut files = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let mut pages = 0usize;
+
+        loop {
+            let page = self
+                .list_objects_page(prefix, continuation_token.as_deref(), None)
+                .await?;
+            pages += 1;
+            files.extend(page.files);
+
+            let Some(next_token) = page.next_continuation_token else {
+                break;
+            };
+            continuation_token = Some(next_token);
+        }
+
+        tracing::debug!(
+            "Found {} files with prefix {} across {} page(s)",
+            files.len(),
+            prefix,
+            pages
+        );
+        Ok(files)
     }
 
     pub async fn init(&self) -> Result<()> {
@@ -558,132 +791,25 @@ impl Store for S3Store {
 
     /// List files with a common prefix and return file info (key, size, last_modified)
     async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
-        self.init().await?;
+        self.list_objects(prefix).await
+    }
 
-        // Apply storage prefix if configured
-        let prefixed = if let Some(path_prefix) = &self.prefix {
-            if path_prefix.ends_with('/') {
-                format!("{}{}", path_prefix, prefix)
-            } else {
-                format!("{}/{}", path_prefix, prefix)
-            }
-        } else {
-            prefix.to_string()
-        };
-
-        tracing::debug!("Listing objects with prefix: {}", prefixed);
-
-        // For S3, we need to sign the list request ourselves
-        // We can use the head_bucket method to get a signed URL, then modify it
-        let head_action = self.bucket.head_bucket(Some(&self.credentials));
-        let head_url = head_action.sign(Duration::from_secs(60));
-
-        // Convert the head URL to a list_objects request
-        let url_str = head_url.to_string();
-        let url = url_str
-            .replace("?", "?list-type=2&prefix=")
-            .replace("?list-type", "&list-type");
-        let url = format!("{}{}", url, urlencoding::encode(&prefixed));
-
-        let request = self.client.request(Method::GET, url);
-        let response = request
-            .send()
+    async fn list_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<FileListPage> {
+        self.list_objects_page(prefix, continuation_token, None)
             .await
-            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+    }
 
-        if !response.status().is_success() {
-            return Err(StoreError::ConnectionError(format!(
-                "Failed to list objects: HTTP {}",
-                response.status()
-            )));
-        }
-
-        // Get the response body
-        let bytes = response
-            .bytes()
+    async fn list_directory_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<FileListPage> {
+        self.list_objects_page(prefix, continuation_token, Some("/"))
             .await
-            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
-        let text = String::from_utf8_lossy(&bytes);
-
-        // Parse the XML response using quick-xml
-        let mut reader = quick_xml::Reader::from_str(&text);
-        reader.trim_text(true);
-
-        let mut buf = Vec::new();
-        let mut files = Vec::new();
-        let mut in_contents = false;
-        let mut current_key = None;
-        let mut current_size = None;
-        let mut current_last_modified = None;
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(quick_xml::events::Event::Start(e)) => {
-                    match e.name().as_ref() {
-                        b"Contents" => in_contents = true,
-                        b"Key" if in_contents => {
-                            if let Ok(text) = reader.read_text(e.name()) {
-                                current_key = Some(text.to_string());
-                            }
-                        }
-                        b"Size" if in_contents => {
-                            if let Ok(text) = reader.read_text(e.name()) {
-                                current_size = text.parse::<u64>().ok();
-                            }
-                        }
-                        b"LastModified" if in_contents => {
-                            if let Ok(text) = reader.read_text(e.name()) {
-                                // Parse RFC3339 date string to timestamp
-                                if let Ok(date_time) = time::OffsetDateTime::parse(
-                                    &text,
-                                    &time::format_description::well_known::Rfc3339,
-                                ) {
-                                    current_last_modified =
-                                        Some(date_time.unix_timestamp_nanos() as u64 / 1_000_000);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(quick_xml::events::Event::End(e)) => {
-                    if e.name().as_ref() == b"Contents" {
-                        in_contents = false;
-
-                        // If we have all required fields, add to our results
-                        if let (Some(key), Some(size), Some(last_modified)) = (
-                            current_key.take(),
-                            current_size.take(),
-                            current_last_modified.take(),
-                        ) {
-                            // Extract just the filename from the full key path
-                            let key_parts: Vec<&str> = key.split('/').collect();
-                            let file_name = key_parts.last().unwrap_or(&"").to_string();
-
-                            if !file_name.is_empty() {
-                                files.push(FileInfo {
-                                    key: file_name,
-                                    size,
-                                    last_modified,
-                                });
-                            }
-                        }
-                    }
-                }
-                Ok(quick_xml::events::Event::Eof) => break,
-                Err(e) => {
-                    return Err(StoreError::ConnectionError(format!(
-                        "Error parsing S3 list response: {}",
-                        e
-                    )));
-                }
-                _ => {}
-            }
-            buf.clear();
-        }
-
-        tracing::debug!("Found {} files with prefix {}", files.len(), prefixed);
-        Ok(files)
     }
 
     async fn list_versions(&self, key: &str) -> Result<Vec<VersionInfo>> {
@@ -1015,7 +1141,6 @@ mod tests {
     #[test]
     fn test_parse_list_objects_xml() {
         use super::*;
-        use quick_xml::Reader;
 
         // Sample S3 ListObjectsV2 response XML
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1048,86 +1173,59 @@ mod tests {
     </Contents>
 </ListBucketResult>"#;
 
-        // Parse the XML response
-        let mut reader = Reader::from_str(xml);
-        reader.trim_text(true);
-
-        let mut buf = Vec::new();
-        let mut files = Vec::new();
-        let mut in_contents = false;
-        let mut current_key = None;
-        let mut current_size = None;
-        let mut current_last_modified = None;
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(quick_xml::events::Event::Start(e)) => {
-                    match e.name().as_ref() {
-                        b"Contents" => in_contents = true,
-                        b"Key" if in_contents => {
-                            if let Ok(text) = reader.read_text(e.name()) {
-                                current_key = Some(text.to_string());
-                            }
-                        }
-                        b"Size" if in_contents => {
-                            if let Ok(text) = reader.read_text(e.name()) {
-                                current_size = text.parse::<u64>().ok();
-                            }
-                        }
-                        b"LastModified" if in_contents => {
-                            if let Ok(_text) = reader.read_text(e.name()) {
-                                // We can't easily test the actual date parsing here, so just store the string
-                                current_last_modified = Some(123456789); // dummy timestamp
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(quick_xml::events::Event::End(e)) => {
-                    if e.name().as_ref() == b"Contents" {
-                        in_contents = false;
-
-                        // If we have all required fields, add to our results
-                        if let (Some(key), Some(size), Some(last_modified)) = (
-                            current_key.take(),
-                            current_size.take(),
-                            current_last_modified.take(),
-                        ) {
-                            // Extract just the filename from the full key path
-                            let key_parts: Vec<&str> = key.split('/').collect();
-                            let file_name = key_parts.last().unwrap_or(&"").to_string();
-
-                            if !file_name.is_empty() {
-                                files.push(FileInfo {
-                                    key: file_name,
-                                    size,
-                                    last_modified,
-                                });
-                            }
-                        }
-                    }
-                }
-                Ok(quick_xml::events::Event::Eof) => break,
-                Err(_) => break,
-                _ => {}
-            }
-            buf.clear();
-        }
+        let page = S3Store::parse_list_response(xml, None).unwrap();
 
         // Verify the results
-        assert_eq!(files.len(), 3);
+        assert_eq!(page.files.len(), 3);
+        assert_eq!(page.common_prefixes, Vec::<String>::new());
+        assert!(!page.truncated);
+        assert_eq!(page.next_continuation_token, None);
 
         // Check first file
-        assert_eq!(files[0].key, "abc123");
-        assert_eq!(files[0].size, 1024);
+        assert_eq!(page.files[0].key, "files/test-doc/abc123");
+        assert_eq!(page.files[0].size, 1024);
 
         // Check second file
-        assert_eq!(files[1].key, "def456");
-        assert_eq!(files[1].size, 2048);
+        assert_eq!(page.files[1].key, "files/test-doc/def456");
+        assert_eq!(page.files[1].size, 2048);
 
         // Check third file
-        assert_eq!(files[2].key, "ghi789");
-        assert_eq!(files[2].size, 3072);
+        assert_eq!(page.files[2].key, "files/test-doc/ghi789");
+        assert_eq!(page.files[2].size, 3072);
+    }
+
+    #[test]
+    fn test_parse_list_objects_xml_strips_storage_prefix_and_reads_token() {
+        use super::*;
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>test-bucket</Name>
+    <Prefix>tenant/files/test-doc/</Prefix>
+    <KeyCount>1</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>true</IsTruncated>
+    <NextContinuationToken>page-2</NextContinuationToken>
+    <CommonPrefixes>
+        <Prefix>tenant/files/test-doc/nested/</Prefix>
+    </CommonPrefixes>
+    <Contents>
+        <Key>tenant/files/test-doc/abc123</Key>
+        <LastModified>2023-01-15T10:00:00.000Z</LastModified>
+        <ETag>"d41d8cd98f00b204e9800998ecf8427e"</ETag>
+        <Size>1024</Size>
+        <StorageClass>STANDARD</StorageClass>
+    </Contents>
+</ListBucketResult>"#;
+
+        let page = S3Store::parse_list_response(xml, Some("tenant/")).unwrap();
+
+        assert!(page.truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some("page-2"));
+        assert_eq!(page.common_prefixes, vec!["files/test-doc/nested/"]);
+        assert_eq!(page.files.len(), 1);
+        assert_eq!(page.files[0].key, "files/test-doc/abc123");
+        assert_eq!(page.files[0].size, 1024);
     }
 }
 
@@ -1160,132 +1258,25 @@ impl Store for S3Store {
 
     /// List files with a common prefix and return file info (key, size, last_modified)
     async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
-        self.init().await?;
+        self.list_objects(prefix).await
+    }
 
-        // Apply storage prefix if configured
-        let prefixed = if let Some(path_prefix) = &self.prefix {
-            if path_prefix.ends_with('/') {
-                format!("{}{}", path_prefix, prefix)
-            } else {
-                format!("{}/{}", path_prefix, prefix)
-            }
-        } else {
-            prefix.to_string()
-        };
-
-        tracing::debug!("Listing objects with prefix: {}", prefixed);
-
-        // For S3, we need to sign the list request ourselves
-        // We can use the head_bucket method to get a signed URL, then modify it
-        let head_action = self.bucket.head_bucket(Some(&self.credentials));
-        let head_url = head_action.sign(Duration::from_secs(60));
-
-        // Convert the head URL to a list_objects request
-        let url_str = head_url.to_string();
-        let url = url_str
-            .replace("?", "?list-type=2&prefix=")
-            .replace("?list-type", "&list-type");
-        let url = format!("{}{}", url, urlencoding::encode(&prefixed));
-
-        let request = self.client.request(Method::GET, url);
-        let response = request
-            .send()
+    async fn list_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<FileListPage> {
+        self.list_objects_page(prefix, continuation_token, None)
             .await
-            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+    }
 
-        if !response.status().is_success() {
-            return Err(StoreError::ConnectionError(format!(
-                "Failed to list objects: HTTP {}",
-                response.status()
-            )));
-        }
-
-        // Get the response body
-        let bytes = response
-            .bytes()
+    async fn list_directory_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<FileListPage> {
+        self.list_objects_page(prefix, continuation_token, Some("/"))
             .await
-            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
-        let text = String::from_utf8_lossy(&bytes);
-
-        // Parse the XML response using quick-xml
-        let mut reader = quick_xml::Reader::from_str(&text);
-        reader.trim_text(true);
-
-        let mut buf = Vec::new();
-        let mut files = Vec::new();
-        let mut in_contents = false;
-        let mut current_key = None;
-        let mut current_size = None;
-        let mut current_last_modified = None;
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(quick_xml::events::Event::Start(e)) => {
-                    match e.name().as_ref() {
-                        b"Contents" => in_contents = true,
-                        b"Key" if in_contents => {
-                            if let Ok(text) = reader.read_text(e.name()) {
-                                current_key = Some(text.to_string());
-                            }
-                        }
-                        b"Size" if in_contents => {
-                            if let Ok(text) = reader.read_text(e.name()) {
-                                current_size = text.parse::<u64>().ok();
-                            }
-                        }
-                        b"LastModified" if in_contents => {
-                            if let Ok(text) = reader.read_text(e.name()) {
-                                // Parse RFC3339 date string to timestamp
-                                if let Ok(date_time) = time::OffsetDateTime::parse(
-                                    &text,
-                                    &time::format_description::well_known::Rfc3339,
-                                ) {
-                                    current_last_modified =
-                                        Some(date_time.unix_timestamp_nanos() as u64 / 1_000_000);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(quick_xml::events::Event::End(e)) => {
-                    if e.name().as_ref() == b"Contents" {
-                        in_contents = false;
-
-                        // If we have all required fields, add to our results
-                        if let (Some(key), Some(size), Some(last_modified)) = (
-                            current_key.take(),
-                            current_size.take(),
-                            current_last_modified.take(),
-                        ) {
-                            // Extract just the filename from the full key path
-                            let key_parts: Vec<&str> = key.split('/').collect();
-                            let file_name = key_parts.last().unwrap_or(&"").to_string();
-
-                            if !file_name.is_empty() {
-                                files.push(FileInfo {
-                                    key: file_name,
-                                    size,
-                                    last_modified,
-                                });
-                            }
-                        }
-                    }
-                }
-                Ok(quick_xml::events::Event::Eof) => break,
-                Err(e) => {
-                    return Err(StoreError::ConnectionError(format!(
-                        "Error parsing S3 list response: {}",
-                        e
-                    )));
-                }
-                _ => {}
-            }
-            buf.clear();
-        }
-
-        tracing::debug!("Found {} files with prefix {}", files.len(), prefixed);
-        Ok(files)
     }
 
     async fn generate_upload_url(

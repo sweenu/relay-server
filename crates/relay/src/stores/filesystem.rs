@@ -81,57 +81,55 @@ impl Store for FileSystemStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
-        let dir_path = self.base_path.join(prefix);
-
-        if !dir_path.exists() || !dir_path.is_dir() {
-            return Ok(Vec::new());
-        }
-
         let mut files = Vec::new();
+        let mut stack = vec![self.base_path.clone()];
 
-        let dir_entries = match read_dir(&dir_path) {
-            Ok(entries) => entries,
-            Err(e) => {
-                return Err(StoreError::ConnectionError(format!(
-                    "Failed to read directory: {}",
-                    e
-                )))
-            }
-        };
-
-        for entry in dir_entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-
-                if path.is_file() {
-                    let metadata = match path.metadata() {
-                        Ok(meta) => meta,
-                        Err(_) => continue, // Skip files we can't read metadata for
-                    };
-
-                    let file_name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|name| name.to_string());
-
-                    if let Some(key) = file_name {
-                        let size = metadata.len();
-
-                        // Get last modified time as milliseconds since epoch
-                        let last_modified = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                            .map(|duration| duration.as_millis() as u64)
-                            .unwrap_or(0);
-
-                        files.push(FileInfo {
-                            key,
-                            size,
-                            last_modified,
-                        });
-                    }
+        while let Some(dir) = stack.pop() {
+            let entries = match read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(StoreError::ConnectionError(format!(
+                        "Failed to read directory: {}",
+                        e
+                    )));
                 }
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !path.is_file() {
+                    continue;
+                }
+
+                let key = match path.strip_prefix(&self.base_path) {
+                    Ok(rel) => rel.to_string_lossy().into_owned(),
+                    Err(_) => continue,
+                };
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+
+                let metadata = match path.metadata() {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                let last_modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0);
+
+                files.push(FileInfo {
+                    key,
+                    size: metadata.len(),
+                    last_modified,
+                });
             }
         }
 
@@ -202,8 +200,9 @@ mod tests {
 
         // Verify that all expected files are in the result
         for (hash, content) in &test_files {
+            let expected_key = format!("files/{}/{}", doc_id, hash);
             let found = files.iter().any(|file| {
-                file.key == *hash
+                file.key == expected_key
                     && file.size == content.as_bytes().len() as u64
                     && file.last_modified > 0
             });

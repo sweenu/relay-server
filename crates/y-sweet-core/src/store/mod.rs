@@ -89,6 +89,13 @@ pub struct FileInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct FileListPage {
+    pub files: Vec<FileInfo>,
+    pub common_prefixes: Vec<String>,
+    pub next_continuation_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct VersionInfo {
     pub version_id: String,
     pub last_modified: u64,
@@ -148,6 +155,34 @@ pub trait Store: 'static {
         Err(StoreError::UnsupportedOperation(
             "This store does not support listing files".to_string(),
         ))
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<FileListPage> {
+        if continuation_token.is_some() {
+            return Ok(FileListPage {
+                files: Vec::new(),
+                common_prefixes: Vec::new(),
+                next_continuation_token: None,
+            });
+        }
+
+        Ok(FileListPage {
+            files: self.list(prefix).await?,
+            common_prefixes: Vec::new(),
+            next_continuation_token: None,
+        })
+    }
+
+    async fn list_directory_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<FileListPage> {
+        self.list_page(prefix, continuation_token).await
     }
 
     async fn list_versions(&self, _key: &str) -> Result<Vec<VersionInfo>> {
@@ -225,6 +260,34 @@ pub trait Store: Send + Sync {
         Err(StoreError::UnsupportedOperation(
             "This store does not support listing files".to_string(),
         ))
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<FileListPage> {
+        if continuation_token.is_some() {
+            return Ok(FileListPage {
+                files: Vec::new(),
+                common_prefixes: Vec::new(),
+                next_continuation_token: None,
+            });
+        }
+
+        Ok(FileListPage {
+            files: self.list(prefix).await?,
+            common_prefixes: Vec::new(),
+            next_continuation_token: None,
+        })
+    }
+
+    async fn list_directory_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<FileListPage> {
+        self.list_page(prefix, continuation_token).await
     }
 
     async fn list_versions(&self, _key: &str) -> Result<Vec<VersionInfo>> {

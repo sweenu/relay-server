@@ -1976,9 +1976,8 @@ async fn handle_file_delete(
             // Delete each file
             let mut deleted_count = 0;
             for file_info in file_infos {
-                let key = file_info.key;
-                if let Err(e) = store.remove(&format!("files/{}/{}", doc_id, key)).await {
-                    tracing::error!("Failed to delete file {}/{}: {}", doc_id, key, e);
+                if let Err(e) = store.remove(&file_info.key).await {
+                    tracing::error!("Failed to delete file {}: {}", file_info.key, e);
                     continue;
                 }
                 deleted_count += 1;
@@ -2174,11 +2173,13 @@ async fn handle_file_history(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
 
-    // Convert the raw file info into the API response format
+    // Convert the raw file info into the API response format. `info.key`
+    // is the full storage key (e.g. `files/<doc_id>/<hash>`); the API
+    // returns just the hash.
     let files = file_infos
         .into_iter()
         .map(|info| FileHistoryEntry {
-            hash: info.key,
+            hash: info.key.rsplit('/').next().unwrap_or(&info.key).to_string(),
             size: info.size,
             created_at: info.last_modified,
         })
