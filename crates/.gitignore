@@ -7,3 +7,5 @@ relay-*.toml
 agent-creds.toml
 localhost.toml
 deploy-staging.sh
+publish-staging.sh
+publish-prod.sh
