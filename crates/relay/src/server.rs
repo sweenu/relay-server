@@ -59,8 +59,6 @@ use y_sweet_core::{
 };
 
 const RELAY_SERVER_VERSION: &str = env!("GIT_VERSION");
-const PING_EVERY: Duration = Duration::from_secs(20);
-const PONG_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
@@ -1163,34 +1161,9 @@ async fn handle_socket(
     let (mut sink, mut stream) = socket.split();
     let (send, mut recv) = channel(1024);
 
-    let last_pong = Arc::new(RwLock::new(tokio::time::Instant::now()));
-    let last_pong_clone = last_pong.clone();
-
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(PING_EVERY);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                msg = recv.recv() => {
-                    let Some(msg) = msg else {
-                        break;
-                    };
-                    let _ = sink.send(msg).await;
-                }
-                _ = ticker.tick() => {
-                    if last_pong_clone
-                        .read()
-                        .expect("Failed to get read lock on last_pong")
-                        .elapsed()
-                        > PONG_TIMEOUT
-                    {
-                        tracing::info!("Pong timeout, closing connection");
-                        break;
-                    }
-                    let _ = sink.send(Message::Ping(vec![])).await;
-                }
-            }
+        while let Some(msg) = recv.recv().await {
+            let _ = sink.send(msg).await;
         }
     });
 
@@ -1220,13 +1193,6 @@ async fn handle_socket(
                 let msg = match msg {
                     Ok(Message::Binary(bytes)) => bytes,
                     Ok(Message::Close(_)) => break,
-                    Ok(Message::Pong(_)) => {
-                        *last_pong
-                            .write()
-                            .expect("Failed to get write lock on last_pong") =
-                            tokio::time::Instant::now();
-                        continue;
-                    }
                     Err(_e) => {
                         // The stream will complain about things like
                         // connections being lost without handshake.
