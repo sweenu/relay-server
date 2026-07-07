@@ -16,13 +16,14 @@ rustPlatform.buildRustPackage rec {
         ./../crates/relay
         ./../crates/y-sweet-core
         ./../crates/y-sign
+        ./../crates/yrs-kvstore
       ]
     );
   };
 
   cargoRoot = "crates";
   buildAndTestSubdir = "crates";
-  cargoHash = "sha256-GmM3vKcjGuTfZfZDkMr09t6ynsUODY0HIG81Qea4wxQ=";
+  cargoHash = "sha256-UNqXOMAcSPIAJKAgJg37McVegCUd+3OtLmYRQ+/Q95M=";
 
   postPatch = ''
     cat > crates/relay/build.rs << 'EOF'
